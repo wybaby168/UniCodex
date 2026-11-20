@@ -7,6 +7,14 @@
 
 在指定的本机项目目录中运行 Codex，使用自己的 API Key，按会话和任务选择供应商、模型与推理强度。模型请求由所选供应商处理并按其 API 规则计费。
 
+## 操作演示
+
+<p align="center">
+  <img src="docs/unicodex-demo.webp" alt="UniCodex 在同一会话从 OpenAI 切换到 DeepSeek，并生成发布检查清单" width="920">
+</p>
+
+在同一会话切换供应商，将上一轮的回答整理成发布清单。录屏使用演示数据。[静态截图](docs/unicodex-demo-still.webp)
+
 ## 主要功能
 
 - **多会话并行**。多个任务可独立运行，会话支持重命名和归档。

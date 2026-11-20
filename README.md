@@ -11,6 +11,14 @@
 
 UniCodex runs Codex coding sessions in the local folders you choose. Bring your own API keys, run several chats at once, and choose the provider, model, and reasoning level for each turn. Model calls go to the selected provider and use that provider’s API billing.
 
+## Demo
+
+<p align="center">
+  <img src="docs/unicodex-demo.webp" alt="UniCodex switches from OpenAI to DeepSeek in the same chat and generates a release checklist" width="920">
+</p>
+
+Continue the same chat with another provider and turn the previous answer into a release checklist. The recording uses sample data. [Still image](docs/unicodex-demo-still.webp)
+
 ## What you can do
 
 - **Work in parallel.** Open multiple chats, let tasks run independently, and rename or archive work as you go.
