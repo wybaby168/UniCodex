@@ -14,10 +14,10 @@ UniCodex runs Codex coding sessions in the local folders you choose. Bring your 
 ## Demo
 
 <p align="center">
-  <img src="docs/unicodex-demo.webp" alt="UniCodex switches from OpenAI to DeepSeek in the same chat and generates a release checklist" width="920">
+  <img src="docs/unicodex-demo-v1.11.5.webp" alt="UniCodex switches from OpenAI to DeepSeek in the same chat and generates a release checklist" width="920">
 </p>
 
-Continue the same chat with another provider and turn the previous answer into a release checklist. The recording uses sample data. [Still image](docs/unicodex-demo-still.webp)
+Continue the same chat with another provider and turn the previous answer into a release checklist. Recorded in the local UniCodex 1.11.5 app with sample data. [Still image](docs/unicodex-demo-still-v1.11.5.webp)
 
 ## What you can do
 

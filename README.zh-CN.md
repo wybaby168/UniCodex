@@ -10,10 +10,10 @@
 ## 操作演示
 
 <p align="center">
-  <img src="docs/unicodex-demo.webp" alt="UniCodex 在同一会话从 OpenAI 切换到 DeepSeek，并生成发布检查清单" width="920">
+  <img src="docs/unicodex-demo-v1.11.5.webp" alt="UniCodex 在同一会话从 OpenAI 切换到 DeepSeek，并生成发布检查清单" width="920">
 </p>
 
-在同一会话切换供应商，将上一轮的回答整理成发布清单。录屏使用演示数据。[静态截图](docs/unicodex-demo-still.webp)
+在同一会话切换供应商，将上一轮的回答整理成发布清单。以本机 UniCodex 1.11.5 录制，使用演示数据。[静态截图](docs/unicodex-demo-still-v1.11.5.webp)
 
 ## 主要功能
 
