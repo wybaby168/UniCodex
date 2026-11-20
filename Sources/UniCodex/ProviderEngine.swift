@@ -112,9 +112,9 @@ final class ProviderEnginePool {
                 "clientInfo": ["name": "local_api_workbench", "title": "UniCodex", "version": version],
                 "capabilities": ["experimentalApi": true, "requestAttestation": false],
             ])
-        guard let runtime = info["codexHome"] as? String,
-            URL(fileURLWithPath: runtime, isDirectory: true).resolvingSymlinksInPath()
-                == paths.codexHome.resolvingSymlinksInPath()
+        guard let runtime = info["codexHome"] as? String, runtime.hasPrefix("/"),
+            URL(fileURLWithPath: runtime, isDirectory: true).resolvingSymlinksInPath().path
+                == paths.codexHome.resolvingSymlinksInPath().path
         else {
             throw WorkbenchError("Codex 引擎没有使用工作台的独立目录。")
         }

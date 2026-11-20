@@ -7,6 +7,8 @@ struct OfflineCheck {
     static func main() async throws {
         signal(SIGPIPE, SIG_IGN)
         let scratch = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        try checkEngineCleanup(in: scratch.appendingPathComponent("Engine Updates", isDirectory: true))
+        try checkAppRelease()
         let credential = scratch.appendingPathComponent("test-credentials.json")
         let aFolder = scratch.appendingPathComponent("Project A", isDirectory: true)
         let bFolder = scratch.appendingPathComponent("Project B", isDirectory: true)
@@ -23,7 +25,8 @@ struct OfflineCheck {
             ProcessInfo.processInfo.environment["WORKBENCH_TEST_CODEX_BINARY"]
             .map { URL(fileURLWithPath: $0) } ?? CodexEngineFiles.bundled
         let paths = EnginePaths(
-            codexHome: scratch.appendingPathComponent("engine", isDirectory: true),
+            // Exercise the URL shape that the engine updater used for a freshly staged home.
+            codexHome: scratch.appendingPathComponent("engine", isDirectory: false),
             credentialFile: credential, binary: binary, endpoint: CommandLine.arguments[2],
             modelCatalog: URL(fileURLWithPath: CommandLine.arguments[3]),
             providerTestEndpoints: [
@@ -191,6 +194,7 @@ struct OfflineCheck {
             "The denied action was executed")
         let approvalThread = approvalSession.threadID
         desk.selectPermissionMode(.alwaysApprove, in: approvalSession)
+        desk.selectCollaborationMode("plan", in: approvalSession)
         desk.focus(b)
 
         desk.close()
@@ -208,8 +212,10 @@ struct OfflineCheck {
                 && reopened.sessions.first { $0.threadID == aThread }?.title == "会话管理验收 A"
                 && reopened.selected.permissionMode == .workspace
                 && reopened.sessions.first { $0.threadID == approvalThread }?.permissionMode == .alwaysApprove
+                && reopened.sessions.first { $0.threadID == approvalThread }?.collaborationModeID == "plan"
+                && reopened.selected.collaborationModeID == "default"
                 && !FileManager.default.fileExists(atPath: paths.codexHome.appendingPathComponent("auth.json").path),
-            "Per-conversation permissions, history or independent auth changed after restart")
+            "Per-conversation modes, permissions, history or independent auth changed after restart")
 
         let oldB = reopened.selected
         try await checking("archive active thread") { try await reopened.setArchived(oldB, true) }
@@ -268,6 +274,7 @@ struct OfflineCheck {
         try await checkProviderHandoff(paths: paths, scratch: scratch, folder: bFolder, defaults: defaults)
     }
 
+    @MainActor
     private static func checkMarkdown(in folder: URL) throws {
         let markdown = """
             # 发布说明
@@ -317,7 +324,8 @@ struct OfflineCheck {
         try require(
             table.columns == [.left, .center, .right] && table.rows.count == 3
                 && table.rows[1][1].first?.link?.path == folder.appendingPathComponent("report preview.svg").path
-                && table.rows[2][1].isEmpty && MessageTextLayout.measure(.table(table), width: 330).height > 55
+                && table.rows[2][1].isEmpty
+                && MessageTextLayout.measure([.table(table, indent: .init())], width: 330).height > 55
                 && document.blocks.contains(.divider(MarkdownIndent()))
                 && document.blocks.last == .code("let count = 3\n"),
             "Markdown tables, links, thematic breaks, or fences did not render correctly")
@@ -327,6 +335,28 @@ struct OfflineCheck {
             TranscriptLayout.blocks(for: partial, in: folder).count == 2
                 && TranscriptLayout.blocks(for: user, in: folder).count == 2,
             "Streaming replies or user messages still display raw block markers")
+        let text = LinkedTextView.readOnly()
+        let size = MessageTextLayout.measure(document.blocks, width: 430)
+        text.update(document.blocks, size: size, muted: false)
+        let string = text.string as NSString
+        let start = string.range(of: "发布说明")
+        let end = string.range(of: "let count = 3")
+        try require(start.location != NSNotFound && end.location != NSNotFound, "The message lost selectable blocks")
+        let range = NSRange(location: start.location, length: NSMaxRange(end) - start.location)
+        text.setSelectedRange(range)
+        let selected = string.substring(with: text.selectedRange())
+        try require(
+            text.selectedRange() == range && selected.hasPrefix("发布说明")
+                && selected.contains("☑\t验收通过") && selected.contains("Alpha")
+                && selected.hasSuffix("let count = 3"),
+            "The native selection did not span the heading, paragraphs, lists, table and code in one message")
+        let appended = document.blocks + [.paragraph([.init(text: "后续进度")])]
+        text.update(appended, size: MessageTextLayout.measure(appended, width: 430), muted: false)
+        try require(text.selectedRange() == range, "Appending text cleared the existing selection")
+        let oversized = [.code(String(repeating: "output_column_", count: 20))] as [MessageDocument.Block]
+        try require(
+            MessageTextLayout.measure(oversized, width: 180).scrollsHorizontally,
+            "A wide code block is no longer horizontally scrollable")
         print("PASS: native Markdown headings, nested task lists, block quotes, tables, links, fences, and streaming")
     }
 
@@ -535,7 +565,8 @@ struct OfflineCheck {
         let original = desk.selected
         let models = try await call("list_models", ["provider": ProviderProfile.originalID])
         try require(
-            (models["providers"] as? [RPCObject])?.count == 1 && models["default_provider"] as? String != nil,
+            (models["providers"] as? [RPCObject])?.count == 1 && models["default_provider"] as? String != nil
+                && Set(models["modes"] as? [String] ?? []).isSuperset(of: ["default", "plan"]),
             "MCP did not list available models")
         let args: RPCObject = [
             "prompt": "OFFLINE_MCP_TASK", "workspace": folder.path, "request_id": "mcp-test",
@@ -589,6 +620,61 @@ struct OfflineCheck {
                 && desk.selected === original,
             "MCP cancellation failed: \(acknowledgement["status"] ?? "missing") -> \(cancelled["status"] ?? "missing")")
         print("PASS: local MCP dispatch, idempotency, default permissions, compact results, and cancellation")
+
+        let originalMode = original.collaborationModeID
+        let planning = try await call(
+            "dispatch_task",
+            [
+                "prompt": "OFFLINE_PLAN_FIXTURE", "workspace": folder.path, "request_id": "native-plan",
+                "mode": "plan", "model": "gpt-6.2-sol", "effort": "high",
+            ])
+        guard let planID = planning["task_id"] as? String,
+            let session = desk.sessions.first(where: { $0.agentTaskID == planID })
+        else { throw WorkbenchError("No Plan mode task was dispatched") }
+        try await waitFor("Native Plan mode question") { !session.inputRequests.isEmpty || !session.isActive }
+        guard let prompt = session.inputRequests.first else {
+            throw WorkbenchError("Plan mode failed to prompt: \(session.error ?? "no engine error")")
+        }
+        let waiting = try await call("task_status", ["task_id": planID, "wait_seconds": 5])
+        try require(
+            waiting["status"] as? String == "waiting_input" && session.permissionMode == .workspace
+                && prompt.questions.first?.choices.map(\.label) == ["Short", "Detailed"]
+                && original.inputRequests.isEmpty && desk.selected === original,
+            "Question, permission, or task status was assigned to the wrong chat")
+        desk.resolve(prompt, in: session, answers: [:])
+        try require(session.answeringInputIDs.isEmpty, "The app submitted an unanswered question")
+        desk.resolve(prompt, in: session, answers: ["detail": "Detailed"])
+        try await waitFor("Streaming native plan") {
+            session.entries.contains { $0.kind == .plan && $0.isStreaming && $0.text.contains("Offline rollout plan") }
+                || !session.isActive
+        }
+        try require(session.isActive && session.proposedPlan == nil, "Incomplete plan was offered for implementation")
+        desk.selectCollaborationMode("default", in: session)
+        try require(
+            session.runningCollaborationModeID == "plan" && original.collaborationModeID == originalMode,
+            "Choosing the next mode disturbed an active or separate chat")
+        desk.selectCollaborationMode("plan", in: session)
+        try Data().write(to: paths.codexHome.deletingLastPathComponent().appendingPathComponent("release-PLAN"))
+        let proposed = try await call("task_status", ["task_id": planID, "wait_seconds": 20])
+        let plan = session.proposedPlan?.text ?? ""
+        try require(
+            proposed["status"] as? String == "completed" && proposed["answer"] as? String == plan
+                && plan.contains("# Offline rollout plan") && !plan.contains("<proposed_plan>")
+                && session.inputRequests.isEmpty && desk.canImplementPlan(in: session),
+            "The real Codex plan was not returned as the task result")
+        let planThread = session.threadID
+        session.draft = "Keep this draft"
+        desk.implementPlan(in: session)
+        try require(session.draft == "Keep this draft" && !session.isActive, "Implement Plan overwrote a draft")
+        session.draft = ""
+        desk.implementPlan(in: session)
+        try await waitFor("Implementation finishes in the same thread") { !session.isActive }
+        try require(
+            session.finalStatus == .completed && session.threadID == planThread
+                && session.collaborationModeID == "default"
+                && session.entries.contains { $0.kind == .answer && $0.text == "stream IMPLEMENT complete" },
+            "Plan mode did not hand off to Default mode: \(session.error ?? "no engine error")")
+        print("PASS: engine-advertised modes, native plan questions and streaming, and implementation in the same chat")
     }
 
     @MainActor
@@ -657,6 +743,108 @@ struct OfflineCheck {
                 "content": ["fixture-only private reasoning"],
             ]) == nil,
             "An entry used raw reasoning instead of the public summary")
+    }
+
+    private static func checkEngineCleanup(in home: URL) throws {
+        let fm = FileManager.default
+        guard let lock = try CodexEngineFiles.acquireUpdateLock(in: home) else {
+            throw WorkbenchError("Could not lock the test engine directory")
+        }
+        defer { try? lock.close() }
+        let competingLock = try CodexEngineFiles.acquireUpdateLock(in: home)
+        try require(competingLock == nil, "Two engine updates acquired the same lock")
+
+        let root = home.appendingPathComponent("engine", isDirectory: true)
+        let active = root.appendingPathComponent("codex-0.2.0")
+        let selected = root.appendingPathComponent("codex-0.3.0")
+        let running = root.appendingPathComponent("codex-0.1.1")
+        let unused = root.appendingPathComponent("codex-0.1.0")
+        let unrelated = home.appendingPathComponent("workspace-history")
+        let symlink = root.appendingPathComponent("codex-0.0.1")
+        let recent = root.appendingPathComponent(".update-" + UUID().uuidString, isDirectory: true)
+        let legacy = root.appendingPathComponent(".update-" + UUID().uuidString, isDirectory: true)
+        let abandoned = try CodexEngineFiles.prepareDownload(in: home)
+        let unexpected = try CodexEngineFiles.prepareDownload(in: home)
+        for target in [active, running, unused] {
+            try fm.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: target)
+        }
+        for directory in [recent, legacy] {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: false)
+        }
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -7200)], ofItemAtPath: legacy.path)
+        try Data().write(to: abandoned.appendingPathComponent("engine.tar.gz"))
+        try Data().write(to: unexpected.appendingPathComponent("user-file"))
+        try Data().write(to: unrelated)
+        try fm.createSymbolicLink(at: symlink, withDestinationURL: unrelated)
+        try Data("0.2.0".utf8).write(to: root.appendingPathComponent("selected-version"))
+
+        let child = Process()
+        child.executableURL = running
+        child.arguments = ["60"]
+        try child.run()
+        defer {
+            if child.isRunning { child.terminate() }
+            child.waitUntilExit()
+        }
+
+        let staging = try CodexEngineFiles.prepareDownload(in: home)
+        let candidate = staging.appendingPathComponent("codex")
+        try fm.copyItem(at: active, to: candidate)
+        try CodexEngineFiles.publish(candidate, version: ReleaseVersion("0.3.0")!, in: home)
+        try fm.removeItem(at: staging)
+        CodexEngineFiles.retireInactive(in: home, active: active)
+        try require(CodexEngineFiles.installed(in: home)?.binary.path == selected.path, "Selected engine was lost")
+        for retired in [unused, legacy, abandoned] {
+            try require(!fm.fileExists(atPath: retired.path), "A retired engine or download remained")
+        }
+        for kept in [active, running, selected, unrelated, symlink, recent, unexpected] {
+            try require(fm.fileExists(atPath: kept.path), "Cleanup removed live or unrelated files")
+        }
+        child.terminate()
+        child.waitUntilExit()
+        CodexEngineFiles.retireInactive(in: home, active: selected)
+        for retired in [active, running] {
+            try require(!fm.fileExists(atPath: retired.path), "Cleanup after restart left an unused engine")
+        }
+    }
+
+    private static func checkAppRelease() throws {
+        func response(_ status: Int) -> HTTPURLResponse {
+            HTTPURLResponse(
+                url: UniCodexRelease.latestEndpoint, statusCode: status, httpVersion: nil, headerFields: nil)!
+        }
+        func asset(_ name: String, state: String = "uploaded", url: String? = nil) -> [String: String] {
+            let path = UniCodexRelease.releasesPage.absoluteString + "/download/v1.11.10/" + name
+            return ["name": name, "state": state, "browser_download_url": url ?? path]
+        }
+        func release(_ assets: [[String: String]], prerelease: Bool = false) throws -> UniCodexRelease? {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "tag_name": "v1.11.10", "draft": false, "prerelease": prerelease, "assets": assets,
+            ])
+            return try UniCodexRelease.read(data, response: response(200), architecture: "arm64")
+        }
+        let empty = try UniCodexRelease.read(Data(), response: response(404))
+        try require(empty == nil, "GitHub without a published release should have no update")
+        let native = asset("UniCodex-macos-arm64.dmg")
+        let universal = asset("UniCodex-macos-universal.zip")
+        let latest = try release([universal, native])
+        let installed = ReleaseVersion("1.11.4")!
+        try require(
+            latest?.version == ReleaseVersion("1.11.10") && latest.map({ $0.version > installed }) == true
+                && latest?.downloadURL?.lastPathComponent == native["name"]
+                && latest?.pageURL.path.hasSuffix("/releases/tag/v1.11.10") == true,
+            "Stable app release did not select the native installer")
+
+        let foreign = asset("UniCodex-macos-arm64.dmg", url: "https://example.org/UniCodex-macos-arm64.dmg")
+        let incomplete = asset("UniCodex-macos-arm64.zip", state: "open")
+        let fallback = try release([foreign, incomplete, universal])
+        let missing = try release([foreign, incomplete, asset("UniCodex-macos-x86_64.dmg")])
+        try require(
+            fallback?.downloadURL?.lastPathComponent == universal["name"] && missing != nil
+                && missing?.downloadURL == nil,
+            "App update linked to a foreign, incomplete or incompatible installer")
+        let preview = try? release([native], prerelease: true)
+        try require(preview == nil, "A prerelease was offered as the latest stable app")
     }
 
     private static func require(_ value: Bool, _ message: String) throws {

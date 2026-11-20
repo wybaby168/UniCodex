@@ -5,21 +5,34 @@ struct ProviderMark: View {
     var size: CGFloat = 15
 
     var body: some View {
-        Self.menuImage(for: kind)
-            .font(.system(size: size, weight: .medium))
-            .frame(width: size, height: size)
-            .accessibilityHidden(true)
+        Group {
+            if let asset = Self.asset(for: kind) {
+                Image(asset)
+                    .renderingMode(.original)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "link").font(.system(size: size, weight: .medium))
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 
     static func menuImage(for kind: ProviderKind) -> Image {
-        let symbol: String
-        switch kind {
-        case .openAI: symbol = "brain"
-        case .deepSeek: symbol = "water.waves"
-        case .kimiCode: symbol = "moon.stars"
-        case .gemini: symbol = "sparkles"
-        case .compatible: symbol = "link"
+        if let asset = asset(for: kind) {
+            return Image(asset).renderingMode(.original)
         }
-        return Image(systemName: symbol)
+        return Image(systemName: "link")
+    }
+
+    private static func asset(for kind: ProviderKind) -> String? {
+        switch kind {
+        case .openAI: "ProviderOpenAI"
+        case .deepSeek: "ProviderDeepSeek"
+        case .kimiCode: "ProviderKimi"
+        case .gemini: "ProviderGemini"
+        case .compatible: nil
+        }
     }
 }

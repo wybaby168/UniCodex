@@ -76,6 +76,7 @@ final class Workbench {
     private(set) var openAICatalog: [ModelChoice] = []
     let providers: ProviderConfiguration
     private(set) var permissionModes = SessionPermissionMode.allCases
+    private(set) var collaborationModes: [CollaborationMode] = []
 
     private let paths: EnginePaths
     private let defaults: UserDefaults
@@ -91,6 +92,7 @@ final class Workbench {
     @ObservationIgnored private var defaultModelID: String
     @ObservationIgnored private var effortPreferences: [String: String]
     @ObservationIgnored private var permissionPreferences: [String: String]
+    @ObservationIgnored private var collaborationPreferences: [String: String]
     @ObservationIgnored private var firstSelection: UUID?
     @ObservationIgnored private lazy var agentTasks = AgentTaskStore(state: paths.state)
     @ObservationIgnored private var agentStopRequests = Set<String>()
@@ -100,6 +102,7 @@ final class Workbench {
     private static let reasoningPreference = "selectedReasoningByModel"
     private static let threadPreference = "lastWorkbenchThread"
     private static let permissionPreference = "workbenchThreadPermissions"
+    private static let collaborationPreference = "workbenchCollaborationModes"
 
     init(
         paths: EnginePaths = .local, defaults: UserDefaults = .standard,
@@ -115,6 +118,7 @@ final class Workbench {
         defaultModelID = model
         effortPreferences = efforts
         permissionPreferences = defaults.dictionary(forKey: Self.permissionPreference) as? [String: String] ?? [:]
+        collaborationPreferences = defaults.dictionary(forKey: Self.collaborationPreference) as? [String: String] ?? [:]
         let saved = defaults.string(forKey: "workspacePath").map { URL(fileURLWithPath: $0, isDirectory: true) }
         let folder = saved ?? paths.workspace
         let profile = providers.profile(providers.defaultProfileID) ?? .original
@@ -154,10 +158,34 @@ final class Workbench {
         model(for: session)?.reasoning(preferred: session.reasoningByModel[reasoningKey(session.route)])
     }
     func canSend(in session: WorkbenchSession) -> Bool {
+        canStartTurn(in: session) && !session.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    private func canStartTurn(in session: WorkbenchSession) -> Bool {
         connection == .ready && session.loadState == .ready && !session.isActive && !session.isManaging
             && !session.isArchived && providers.configured(profile(for: session)) && model(for: session) != nil
             && permissionModes.contains(session.permissionMode)
-            && !session.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    func collaborationMode(for session: WorkbenchSession) -> CollaborationMode {
+        collaborationModes.first { $0.id == session.collaborationModeID } ?? .standard
+    }
+    func selectCollaborationMode(_ id: String, in session: WorkbenchSession) {
+        guard !session.isArchived, !session.isManaging, collaborationModes.contains(where: { $0.id == id }) else {
+            return
+        }
+        session.collaborationModeID = id
+        recordCollaborationMode(for: session)
+    }
+    func canImplementPlan(in session: WorkbenchSession) -> Bool {
+        canStartTurn(in: session) && collaborationMode(for: session).isPlan
+            && collaborationModes.contains { $0.id == CollaborationMode.standard.id }
+            && (session.finalStatus == nil || session.finalStatus == .completed)
+            && session.proposedPlan != nil
+    }
+    func implementPlan(in session: WorkbenchSession) {
+        guard canImplementPlan(in: session), session.draft.isEmpty else { return }
+        selectCollaborationMode(CollaborationMode.standard.id, in: session)
+        session.draft = UIStrings.current.text("mode.implement_prompt")
+        send(in: session)
     }
     func canStop(in session: WorkbenchSession) -> Bool {
         guard session.runningConnection?.isOpen == true, case .running = session.runState else { return false }
@@ -275,10 +303,13 @@ final class Workbench {
                 providers.noteOriginalKey(available: originalKey != nil)
                 connectionStatus = "connection.catalog"
                 async let requirements = try? server.request("configRequirements/read", timeout: 5)
+                async let modes = try? server.request("collaborationMode/list", timeout: 5)
                 await loadModels(server, key: originalKey)
                 let configuredRequirements = (await requirements)?["requirements"] as? RPCObject ?? [:]
+                let supportedModes = CollaborationMode.advertised(in: await modes)
                 guard rpc === server else { return }
                 permissionModes = SessionPermissionMode.allCases.filter { $0.allowed(by: configuredRequirements) }
+                collaborationModes = supportedModes
                 connectionStatus = ""
                 connection = .ready
                 await loadConversations()
@@ -489,6 +520,9 @@ final class Workbench {
         if permissionPreferences.removeValue(forKey: threadID) != nil {
             defaults.set(permissionPreferences, forKey: Self.permissionPreference)
         }
+        if collaborationPreferences.removeValue(forKey: threadID) != nil {
+            defaults.set(collaborationPreferences, forKey: Self.collaborationPreference)
+        }
         guard let session = byThread.removeValue(forKey: threadID), session.threadID == threadID else { return }
         for segment in segments(for: session) {
             byThread.removeValue(forKey: segment.threadID)
@@ -518,7 +552,9 @@ final class Workbench {
         let profile = profile(for: session)
         let route = session.route
         let effort = reasoning(for: session)?.id ?? model.defaultEffort
-        let mode = session.permissionMode
+        let permissions = session.permissionMode
+        let collaboration = collaborationMode(for: session)
+        let nativeCollaboration = collaborationModes.contains(where: { $0.id == collaboration.id })
         let input = session.draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let workspace = session.folder.resolvingSymlinksInPath()
         guard Self.isDirectory(workspace) else {
@@ -531,6 +567,7 @@ final class Workbench {
         session.runState = .starting
         session.submissionID = clientID
         session.runningRoute = route
+        session.runningCollaborationModeID = collaboration.id
         session.optimisticID = clientID
         session.finalStatus = nil
         if session.entries.isEmpty && session.pendingDraftName == nil {
@@ -546,13 +583,13 @@ final class Workbench {
                 session.runningConnection = engine
                 let threadID = try await threadID(
                     for: session, workspace: workspace, route: route, profile: profile,
-                    mode: mode, using: engine, optimistic: clientID)
+                    mode: permissions, using: engine, optimistic: clientID)
                 guard session.submissionID == clientID else { return }
                 session.runningThreadID = threadID
                 updateAgentTask(for: session)
                 var request: RPCObject = [
                     "threadId": threadID, "clientUserMessageId": clientID, "model": model.id,
-                    "approvalPolicy": mode.approvalPolicy, "sandboxPolicy": mode.sandboxPolicy,
+                    "approvalPolicy": permissions.approvalPolicy, "sandboxPolicy": permissions.sandboxPolicy,
                     "approvalsReviewer": "user",
                     "input": [["type": "text", "text": input, "text_elements": [RPCObject]()]],
                 ]
@@ -560,6 +597,9 @@ final class Workbench {
                     request["summary"] = "auto"
                 }
                 if let effort { request["effort"] = effort }
+                if nativeCollaboration {
+                    request["collaborationMode"] = collaboration.settings(model: model.id, effort: effort)
+                }
                 let response = try await engine.request("turn/start", request, timeout: 60)
                 guard session.submissionID == clientID else { return }
                 if session.runState == .starting {
@@ -610,6 +650,18 @@ final class Workbench {
             try rpc.reply(to: current.wireID, result: option.result)
             session.answeringApprovalIDs.insert(current.id)
         } catch { session.error = redact(error.localizedDescription) }
+    }
+
+    func resolve(_ input: UserInputRequest, in session: WorkbenchSession, answers: [String: String]) {
+        guard let rpc = session.runningConnection, session.isActive,
+            !session.answeringInputIDs.contains(input.id),
+            let current = session.inputRequests.first(where: { $0.id == input.id && $0.turnID == input.turnID }),
+            let response = current.response(to: answers)
+        else { return }
+        do {
+            try rpc.reply(to: current.wireID, result: response)
+            session.answeringInputIDs.insert(current.id)
+        } catch { session.error = rpc.safeMessage(error.localizedDescription) }
     }
 
     private func preferredRoute(for profile: ProviderProfile) -> ModelRoute {
@@ -726,6 +778,7 @@ final class Workbench {
         session.contextLimited = context?.trimmed ?? false
         if isFirst {
             recordPermissionMode(for: session)
+            recordCollaborationMode(for: session)
             if selected === session { defaults.set(thread.id, forKey: Self.threadPreference) }
             if let name = session.pendingDraftName {
                 do {
@@ -854,6 +907,7 @@ final class Workbench {
         session.isArchived = archived
         session.permissionMode =
             permissionPreferences[thread.id].flatMap(SessionPermissionMode.init(rawValue:)) ?? .workspace
+        session.collaborationModeID = collaborationPreferences[thread.id] ?? CollaborationMode.standard.id
         session.loadState = .unloaded
         byThread[thread.id] = session
         for segment in stored?.segments ?? [] { byThread[segment.threadID] = session }
@@ -867,7 +921,7 @@ final class Workbench {
         }
         server.onRequest = { [weak self, weak server] id, method, params in
             guard let self, let server else { return }
-            self.approvalRequest(id: id, method: method, params: params, from: server)
+            self.serverRequest(id: id, method: method, params: params, from: server)
         }
         server.onDisconnect = { [weak self, weak server] explanation in
             guard let self, let server else { return }
@@ -902,8 +956,9 @@ final class Workbench {
         session.runningThreadID = nil
         session.runningRoute = nil
         session.agentTurnAcknowledged = false
-        session.clearApprovals()
+        session.clearRequests()
         updateAgentTask(for: session)
+        session.runningCollaborationModeID = nil
         providerConfigurationChanged()
     }
 
@@ -960,41 +1015,51 @@ final class Workbench {
         case "item/started", "item/completed":
             guard let data = params["item"] as? RPCObject, var item = TranscriptEntry(data) else { return }
             item.id = session.key(for: item.id, in: threadID)
-            if item.kind == .answer || item.kind == .progress || item.kind == .reasoning {
+            if item.kind == .answer || item.kind == .progress || item.kind == .reasoning || item.kind == .plan {
                 item.isStreaming = method == "item/started"
             }
             if item.kind != .user || !session.reconcileUser(item, clientID: data["clientId"] as? String) {
                 session.upsert(item)
             }
-        case "item/agentMessage/delta":
+        case "item/agentMessage/delta", "item/plan/delta":
             guard let id = params["itemId"] as? String, let text = params["delta"] as? String else { return }
-            session.appendDelta(id: session.key(for: id, in: threadID), text: text)
+            session.appendDelta(
+                id: session.key(for: id, in: threadID), text: text,
+                kind: method == "item/plan/delta" ? .plan : .answer)
         case "item/reasoning/summaryTextDelta":
             guard let id = params["itemId"] as? String, let text = params["delta"] as? String,
                 let part = params["summaryIndex"] as? Int
             else { return }
             session.appendDelta(id: session.key(for: id, in: threadID), text: text, summaryIndex: part)
         case "serverRequest/resolved":
-            if let id = params["requestId"] { session.clearApproval(Approval.key(for: id)) }
+            if let id = params["requestId"] { session.clearRequest(Approval.key(for: id)) }
             updateAgentTask(for: session)
         default: break
         }
     }
 
-    private func approvalRequest(id: Any, method: String, params: RPCObject, from server: CodexConnection) {
+    private func serverRequest(id: Any, method: String, params: RPCObject, from server: CodexConnection) {
         guard let thread = params["threadId"] as? String, let session = byThread[thread], session.isActive,
             session.runningConnection === server, session.runningThreadID == thread,
-            let approval = Approval(
-                wireID: id, method: method, params: params,
-                itemDetail: (params["itemId"] as? String).flatMap { session.entry(session.key(for: $0, in: thread)) }?
-                    .detail),
-            session.runState.turnID == nil || session.runState.turnID == approval.turnID,
-            !approval.options.isEmpty
+            let turn = params["turnId"] as? String,
+            session.runState.turnID == nil || session.runState.turnID == turn
         else {
             server.unsupported(id, method: method)
             return
         }
-        if !session.approvals.contains(where: { $0.id == approval.id }) { session.approvals.append(approval) }
+        if method == "item/tool/requestUserInput", let input = UserInputRequest(wireID: id, params: params) {
+            if !session.inputRequests.contains(where: { $0.id == input.id }) { session.inputRequests.append(input) }
+        } else if let approval = Approval(
+            wireID: id, method: method, params: params,
+            itemDetail: (params["itemId"] as? String).flatMap { session.entry(session.key(for: $0, in: thread)) }?
+                .detail),
+            !approval.options.isEmpty
+        {
+            if !session.approvals.contains(where: { $0.id == approval.id }) { session.approvals.append(approval) }
+        } else {
+            server.unsupported(id, method: method)
+            return
+        }
         updateAgentTask(for: session)
     }
 
@@ -1055,6 +1120,11 @@ final class Workbench {
         if let effort = input.effort, !model.reasoningChoices.contains(where: { $0.id == effort }) {
             throw WorkbenchError(UIStrings.current.text("error.mcp_effort"))
         }
+        let collaborationID = input.mode ?? CollaborationMode.standard.id
+        guard
+            collaborationID == CollaborationMode.standard.id
+                || collaborationModes.contains(where: { $0.id == collaborationID })
+        else { throw WorkbenchError(UIStrings.current.text("mode.unavailable", collaborationID)) }
         guard let permission = [SessionPermissionMode.workspace, .readOnly].first(where: permissionModes.contains)
         else {
             throw WorkbenchError("当前配置没有可供 MCP 派遣的工作区权限。")
@@ -1063,6 +1133,7 @@ final class Workbench {
         let session = WorkbenchSession(folder: workingFolder, modelID: modelID, reasoningByModel: effortPreferences)
         session.profileID = profile.id
         session.permissionMode = permission
+        session.collaborationModeID = collaborationID
         if let effort = input.effort { session.reasoningByModel[reasoningKey(session.route)] = effort }
         session.draft = prompt
         session.agentTaskID = id
@@ -1080,6 +1151,7 @@ final class Workbench {
         var results = try agentTasks.existing(id)?.response() ?? record.response()
         results["provider"] = profile.id
         results["model"] = modelID
+        results["mode"] = collaborationID
         return results
     }
 
@@ -1099,7 +1171,7 @@ final class Workbench {
             guard let record = try agentTasks.existing(query.taskID) else {
                 throw WorkbenchError(UIStrings.current.text("error.mcp_task_missing"))
             }
-            if record.status.isFinished || record.status == .waitingApproval
+            if record.status.isFinished || record.status == .waitingApproval || record.status == .waitingInput
                 || query.afterRevision.map({ $0 != record.revision }) == true || ContinuousClock.now >= deadline
             {
                 return record.response(after: query.afterRevision, offset: offset, limit: limit)
@@ -1145,7 +1217,8 @@ final class Workbench {
             }
             return row
         }
-        return ["default_provider": providers.defaultProfileID, "providers": values]
+        let modes = collaborationModes.isEmpty ? [CollaborationMode.standard.id] : collaborationModes.map(\.id)
+        return ["default_provider": providers.defaultProfileID, "providers": values, "modes": modes]
     }
 
     private func waitForAgentEngine() async throws {
@@ -1174,7 +1247,14 @@ final class Workbench {
         let status: AgentTaskStatus
         switch session.runState {
         case .starting: status = stopping ? .stopping : .starting
-        case .running: status = stopping ? .stopping : (session.approvals.isEmpty ? .running : .waitingApproval)
+        case .running:
+            if stopping {
+                status = .stopping
+            } else if !session.inputRequests.isEmpty {
+                status = .waitingInput
+            } else {
+                status = session.approvals.isEmpty ? .running : .waitingApproval
+            }
         case .stopping: status = .stopping
         case .idle:
             agentStopRequests.remove(id)
@@ -1185,7 +1265,9 @@ final class Workbench {
             default: status = .failed
             }
         }
-        let answer = status.isFinished ? session.entries.last(where: { $0.kind == .answer })?.text : nil
+        let plan =
+            status == .completed && session.runningCollaborationModeID == "plan" ? session.proposedPlan?.text : nil
+        let answer = status.isFinished ? plan ?? session.entries.last(where: { $0.kind == .answer })?.text : nil
         agentTasks.update(
             id, status: status, sessionID: session.threadID,
             answer: answer.map(redact), error: session.error.map(redact))
@@ -1202,6 +1284,12 @@ final class Workbench {
         guard let threadID = session.threadID else { return }
         permissionPreferences[threadID] = session.permissionMode == .workspace ? nil : session.permissionMode.rawValue
         defaults.set(permissionPreferences, forKey: Self.permissionPreference)
+    }
+    private func recordCollaborationMode(for session: WorkbenchSession) {
+        guard let threadID = session.threadID else { return }
+        let id = session.collaborationModeID
+        collaborationPreferences[threadID] = id == CollaborationMode.standard.id ? nil : id
+        defaults.set(collaborationPreferences, forKey: Self.collaborationPreference)
     }
     private static func isDirectory(_ location: URL) -> Bool {
         (try? location.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true

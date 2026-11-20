@@ -59,6 +59,42 @@ class Fixture(BaseHTTPRequestHandler):
                 return
         prompt = json.dumps(body.get("input", []), ensure_ascii=False)
         marker = "A" if "OFFLINE_PARALLEL_A" in prompt else "B"
+        if "OFFLINE_PLAN_FIXTURE" in latest:
+            if body["model"] != "gpt-6.2-sol" or body.get("reasoning", {}).get("effort") != "high":
+                self.send_error(400, "Plan mode overrode the selected model or reasoning effort")
+                return
+            if "request_user_input" not in tool_names:
+                self.send_error(400, "Plan mode did not enable native user input")
+                return
+            call_id = "call_offline_plan_question"
+            result = next((item for item in body.get("input", [])
+                           if item.get("type") == "function_call_output" and item.get("call_id") == call_id), None)
+            if result is None:
+                questions = [{
+                    "id": "detail", "header": "Detail", "question": "How detailed should the rollout plan be?",
+                    "isOther": False, "isSecret": False,
+                    "options": [
+                        {"label": "Short", "description": "A brief checklist."},
+                        {"label": "Detailed", "description": "Include validation steps."},
+                    ],
+                }]
+                self.direct_tool_call(body, request_number, "request_user_input", {"questions": questions}, call_id)
+                return
+            if "Detailed" not in json.dumps(result.get("output"), ensure_ascii=False):
+                self.send_error(400, "Plan clarification did not reach the engine")
+                return
+            marker = "PLAN"
+        elif "mode.implement_prompt" in latest:
+            if "OFFLINE_PLAN_FIXTURE" not in prompt or "Offline rollout plan" not in prompt:
+                self.send_error(400, "Plan implementation lost its conversation context")
+                return
+            mode_messages = [part["text"] for item in body.get("input", []) if item.get("role") == "developer"
+                             for part in item.get("content", [])
+                             if "<collaboration_mode>" in part.get("text", "")]
+            if not mode_messages or "# Collaboration Mode: Default" not in mode_messages[-1]:
+                self.send_error(400, "The implementation did not select native Default mode")
+                return
+            marker = "IMPLEMENT"
         if "OFFLINE_MCP_STOP" in latest:
             marker = "MCP_STOP"
         expected_history = {
@@ -104,8 +140,13 @@ class Fixture(BaseHTTPRequestHandler):
             marker = stage
         response_id = f"resp_offline_{request_number}"
         message_id = f"msg_offline_{request_number}"
-        prefix = f"switch {stage}" if stage else f"stream {marker}"
-        text = f"{prefix} complete"
+        if marker == "PLAN":
+            prefix = "<proposed_plan>\n# Offline rollout plan\n\n"
+            tail = "- Verify the selected workspace.\n</proposed_plan>"
+        else:
+            prefix = f"switch {stage}" if stage else f"stream {marker}"
+            tail = " complete"
+        text = prefix + tail
         item = {"id": message_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}
         part = {"type": "output_text", "text": text, "annotations": []}
         completed = {**item, "content": [part], "status": "completed"}
@@ -126,7 +167,7 @@ class Fixture(BaseHTTPRequestHandler):
             ("response.output_item.added", {"output_index": 0, "item": item}),
             ("response.content_part.added", {"item_id": message_id, "output_index": 0, "content_index": 0, "part": {**part, "text": ""}}),
             ("response.output_text.delta", {"item_id": message_id, "output_index": 0, "content_index": 0, "delta": prefix}),
-            ("response.output_text.delta", {"item_id": message_id, "output_index": 0, "content_index": 0, "delta": " complete"}),
+            ("response.output_text.delta", {"item_id": message_id, "output_index": 0, "content_index": 0, "delta": tail}),
             ("response.output_text.done", {"item_id": message_id, "output_index": 0, "content_index": 0, "text": text}),
             ("response.content_part.done", {"item_id": message_id, "output_index": 0, "content_index": 0, "part": part}),
             ("response.output_item.done", {"output_index": 0, "item": completed}),
@@ -145,7 +186,7 @@ class Fixture(BaseHTTPRequestHandler):
             self.wfile.flush()
             gate = self.server.directory / f"release-{marker}"
             deadline = time.monotonic() + 20
-            while marker in ("A", "B", "ROOT", "MCP_STOP") and not gate.exists() and time.monotonic() < deadline:
+            while marker in ("A", "B", "ROOT", "MCP_STOP", "PLAN") and not gate.exists() and time.monotonic() < deadline:
                 time.sleep(0.035)
             self.wfile.write(b"".join(data[4:]))
         except (BrokenPipeError, ConnectionResetError):
@@ -221,11 +262,11 @@ class Fixture(BaseHTTPRequestHandler):
             self.wfile.write(event)
             self.wfile.flush()
 
-    def direct_tool_call(self, body, number, name, args):
+    def direct_tool_call(self, body, number, name, args, call_id="call_offline_provider_environment"):
         response = {"id": f"resp_direct_tool_{number}", "object": "response", "output": [],
                     "status": "in_progress", "created_at": 0, "model": body["model"]}
         tool = {"id": f"fc_direct_{number}", "type": "function_call", "name": name,
-                "call_id": "call_offline_provider_environment", "arguments": json.dumps(args), "status": "completed"}
+                "call_id": call_id, "arguments": json.dumps(args), "status": "completed"}
         events = [
             ("response.created", {"response": response}),
             ("response.output_item.added", {"item": {**tool, "arguments": "", "status": "in_progress"}, "output_index": 0}),
@@ -350,7 +391,7 @@ def local_fixture(directory):
         try:
             yield server
         finally:
-            for marker in ("A", "B", "ROOT", "MCP_STOP"):
+            for marker in ("A", "B", "ROOT", "MCP_STOP", "PLAN"):
                 (server.directory / f"release-{marker}").touch()
             server.shutdown()
             thread.join()

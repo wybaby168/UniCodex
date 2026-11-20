@@ -166,38 +166,166 @@ enum MessageMarkup {
     }
 }
 
-enum MessageTextContent: Equatable {
-    case runs([MessageRun], heading: Int? = nil)
-    case table(MarkdownTable)
-}
+struct MessageTextSize: Equatable, Sendable {
+    let viewportWidth: CGFloat
+    let documentWidth: CGFloat
+    let height: CGFloat
 
-struct MessageParagraph: View {
-    let content: MessageTextContent
-    var muted = false
-    @Environment(\.workbenchTheme) private var theme
-
-    var body: some View {
-        LinkedMessageText(content: content, theme: theme, muted: muted)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
+    var scrollsHorizontally: Bool { documentWidth > viewportWidth }
 }
 
 enum MessageTextLayout {
-    static func attributed(_ content: MessageTextContent, muted: Bool) -> NSAttributedString {
-        switch content {
-        case .runs(let runs, let heading):
-            let output = NSMutableAttributedString()
-            append(runs, to: output, muted: muted, paragraph: paragraph(), heading: heading)
-            return output
-        case .table(let table):
-            return attributedTable(table, muted: muted)
+    private static let codePadding: CGFloat = 10
+    private static let minimumColumnWidth: CGFloat = 94
+    private static let blockGap: CGFloat = 9
+
+    static func measure(
+        _ blocks: [MessageDocument.Block], width: CGFloat, muted: Bool = false, fitsContent: Bool = false
+    ) -> MessageTextSize {
+        let documentWidth = blocks.reduce(width) { result, block in
+            switch block {
+            case .code(let text, let indent):
+                let font = TranscriptTypography.nativeFont(for: .init(text: "", code: true), muted: muted)
+                var widest: CGFloat = 0
+                text.enumerateLines { line, _ in
+                    widest = max(widest, (line as NSString).size(withAttributes: [.font: font]).width)
+                }
+                return max(result, min(1_000_000, ceil(widest) + 2 + 2 * codePadding + indent.leading))
+            case .table(let table, let indent):
+                return max(result, minimumColumnWidth * CGFloat(table.columns.count) + indent.leading)
+            default:
+                return result
+            }
         }
+        let preview = MessageTextSize(viewportWidth: width, documentWidth: documentWidth, height: 0)
+        let storage = NSTextStorage(attributedString: attributed(blocks, size: preview, muted: muted))
+        let manager = NSLayoutManager()
+        manager.backgroundLayoutEnabled = false
+        let container = NSTextContainer(size: .init(width: documentWidth, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        let height = max(18, ceil(used.maxY) + 1)
+        if fitsContent && !preview.scrollsHorizontally
+            && blocks.allSatisfy({
+                if case .paragraph(_, let style) = $0 { return style.indent.quotes == 0 }
+                return false
+            })
+        {
+            let fitted = min(width, max(1, ceil(used.maxX) + 2))
+            return .init(viewportWidth: fitted, documentWidth: fitted, height: height)
+        }
+        return .init(viewportWidth: width, documentWidth: documentWidth, height: height)
+    }
+
+    static func attributed(
+        _ blocks: [MessageDocument.Block], size: MessageTextSize, muted: Bool
+    ) -> NSAttributedString {
+        let output = NSMutableAttributedString()
+        for block in blocks {
+            if output.length > 0 { separateBlocks(in: output) }
+            let indent = block.indent
+            let quoteWidth: CGFloat
+            switch block {
+            case .code, .table: quoteWidth = size.documentWidth
+            case .paragraph, .divider: quoteWidth = size.viewportWidth
+            }
+            let quote = quoteBlocks(indent.quotes, width: quoteWidth)
+            let leading = indent.leading - indent.quoteWidth
+            let style = paragraph()
+            style.firstLineHeadIndent = leading
+            style.headIndent = leading
+            style.textBlocks = quote
+            switch block {
+            case .paragraph(let runs, let markdown):
+                if quote.isEmpty { style.tailIndent = size.viewportWidth - size.documentWidth }
+                if let marker = indent.marker {
+                    style.firstLineHeadIndent = indent.markerX - indent.quoteWidth
+                    style.tabStops = [NSTextTab(textAlignment: .left, location: leading)]
+                    append([.init(text: marker + "\t")], to: output, muted: muted, paragraph: style)
+                }
+                append(runs, to: output, muted: muted, paragraph: style, heading: markdown.heading)
+            case .code(let raw, _):
+                let code = NSTextBlock()
+                code.setContentWidth(max(1, size.documentWidth - indent.leading - 2 * codePadding), type: .absolute)
+                code.setWidth(codePadding, type: .absolute, for: .padding)
+                code.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.12)
+                style.textBlocks.append(code)
+                style.lineBreakMode = .byCharWrapping
+                let text = raw.hasSuffix("\n") ? String(raw.dropLast()) : raw
+                append(
+                    [.init(text: text.isEmpty ? "\u{00a0}" : text, code: true)], to: output, muted: muted,
+                    paragraph: style)
+            case .table(let table, _):
+                appendTable(
+                    table, to: output, leading: leading, quotes: quote,
+                    width: max(
+                        size.viewportWidth - indent.leading, minimumColumnWidth * CGFloat(table.columns.count)),
+                    muted: muted)
+            case .divider:
+                let line = NSTextBlock()
+                line.setContentWidth(max(1, size.viewportWidth - indent.leading), type: .absolute)
+                setEdge(line, border: 1, padding: 0, at: .minYEdge)
+                line.setBorderColor(.separatorColor)
+                style.textBlocks.append(line)
+                style.minimumLineHeight = 4
+                style.maximumLineHeight = 4
+                output.append(
+                    NSAttributedString(
+                        string: "\u{00a0}",
+                        attributes: [
+                            .font: NSFont.systemFont(ofSize: 1), .paragraphStyle: style,
+                        ]))
+            }
+        }
+        return output
     }
 
     private static func paragraph() -> NSMutableParagraphStyle {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = TranscriptTypography.lineSpacing
         return style
+    }
+
+    private static func separateBlocks(in output: NSMutableAttributedString) {
+        let last = output.length - 1
+        if output.mutableString.character(at: last) != 10 {
+            output.append(
+                NSAttributedString(string: "\n", attributes: output.attributes(at: last, effectiveRange: nil)))
+        }
+        let gap = NSMutableParagraphStyle()
+        gap.minimumLineHeight = blockGap
+        gap.maximumLineHeight = blockGap
+        output.append(
+            NSAttributedString(
+                string: "\n",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 1), .paragraphStyle: gap,
+                ]))
+    }
+
+    private static func quoteBlocks(_ count: Int, width: CGFloat) -> [NSTextBlock] {
+        (0..<count).map { index in
+            let quote = NSTextBlock()
+            let inset = MarkdownIndent(quotes: index + 1).quoteWidth
+            quote.setContentWidth(max(1, width - inset), type: .absolute)
+            setEdge(quote, border: 2, padding: 10, at: .minXEdge)
+            quote.setBorderColor(.separatorColor)
+            return quote
+        }
+    }
+
+    private static func setEdge(_ block: NSTextBlock, border: CGFloat, padding: CGFloat, at edge: CGRectEdge) {
+        if #available(macOS 27, *) {
+            block.setWidth(border, type: .absolute, for: .border, rectEdge: edge)
+            block.setWidth(padding, type: .absolute, for: .padding, rectEdge: edge)
+        } else {
+            let legacy: NSRectEdge = edge == .minXEdge ? .minX : .minY
+            block.setWidth(border, type: .absolute, for: .border, edge: legacy)
+            block.setWidth(padding, type: .absolute, for: .padding, edge: legacy)
+        }
     }
 
     private static func append(
@@ -217,16 +345,20 @@ enum MessageTextLayout {
         }
     }
 
-    private static func attributedTable(_ model: MarkdownTable, muted: Bool) -> NSAttributedString {
-        let output = NSMutableAttributedString()
+    private static func appendTable(
+        _ model: MarkdownTable, to output: NSMutableAttributedString, leading: CGFloat, quotes: [NSTextBlock],
+        width: CGFloat, muted: Bool
+    ) {
         let table = NSTextTable()
         table.numberOfColumns = model.columns.count
         table.layoutAlgorithm = .fixed
         table.collapsesBorders = true
-        table.setValue(100, type: .percentage, for: .width)
+        table.setContentWidth(width, type: .absolute)
         for (rowNumber, row) in model.rows.enumerated() {
             for (column, typed) in row.enumerated() where model.columns.indices.contains(column) {
                 let style = paragraph()
+                style.firstLineHeadIndent = leading
+                style.headIndent = leading
                 switch model.columns[column] {
                 case .left: style.alignment = .left
                 case .center: style.alignment = .center
@@ -240,59 +372,28 @@ enum MessageTextLayout {
                 cell.setWidth(0.5, type: .absolute, for: .border)
                 cell.setBorderColor(.separatorColor)
                 if rowNumber == 0 { cell.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.09) }
-                style.textBlocks = [cell]
+                style.textBlocks = quotes + [cell]
                 let runs = typed.isEmpty ? [MessageRun(text: "\u{00a0}")] : typed
                 append(runs, to: output, muted: muted, paragraph: style, emphasized: rowNumber == 0)
                 append([MessageRun(text: "\n")], to: output, muted: muted, paragraph: style)
             }
         }
-        return output
-    }
-
-    static func measure(_ content: MessageTextContent, width: CGFloat, muted: Bool = false) -> CGSize {
-        let storage = NSTextStorage(attributedString: attributed(content, muted: muted))
-        let manager = NSLayoutManager()
-        manager.backgroundLayoutEnabled = false
-        let container = NSTextContainer(size: .init(width: width, height: .greatestFiniteMagnitude))
-        container.lineFragmentPadding = 0
-        manager.addTextContainer(container)
-        storage.addLayoutManager(manager)
-        manager.ensureLayout(for: container)
-        let used = manager.usedRect(for: container)
-        return CGSize(width: min(width, max(1, ceil(used.maxX) + 2)), height: height(of: used))
-    }
-
-    static func height(of rect: CGRect) -> CGFloat {
-        max(18, ceil(rect.maxY) + 1)
     }
 }
 
-private struct LinkedMessageText: NSViewRepresentable {
-    let content: MessageTextContent
+struct LinkedMessageText: NSViewRepresentable {
+    let blocks: [MessageDocument.Block]
+    let size: MessageTextSize
     let theme: WorkbenchTheme
     let muted: Bool
 
     func makeNSView(context: Context) -> LinkedTextView {
-        let view = LinkedTextView(frame: .zero)
-        view.isEditable = false
-        view.isSelectable = true
-        view.drawsBackground = false
-        view.delegate = view
-        view.textContainerInset = .zero
-        view.textContainer?.lineFragmentPadding = 0
-        view.textContainer?.widthTracksTextView = true
-        view.textContainer?.heightTracksTextView = false
-        view.isHorizontallyResizable = false
-        view.isVerticallyResizable = true
-        _ = view.layoutManager
-        return view
+        LinkedTextView.readOnly()
     }
 
     func updateNSView(_ view: LinkedTextView, context: Context) {
-        let toneChanged = view.muted != muted
-        if view.theme != theme || toneChanged {
+        if view.theme != theme || view.muted != muted {
             view.theme = theme
-            view.muted = muted
             view.linkTextAttributes = [
                 .foregroundColor: muted ? NSColor.secondaryLabelColor : theme.linkColor,
                 .underlineStyle: NSUnderlineStyle.single.rawValue,
@@ -300,26 +401,56 @@ private struct LinkedMessageText: NSViewRepresentable {
             ]
             view.needsDisplay = true
         }
-        guard view.renderedContent != content || toneChanged else { return }
-        view.renderedContent = content
-        view.textStorage?.setAttributedString(MessageTextLayout.attributed(content, muted: muted))
-        view.invalidateIntrinsicContentSize()
-    }
-
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: LinkedTextView, context: Context) -> CGSize? {
-        guard let width = proposal.width, width.isFinite, width > 0,
-            let container = nsView.textContainer, let manager = nsView.layoutManager
-        else { return nil }
-        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
-        manager.ensureLayout(for: container)
-        return CGSize(width: width, height: MessageTextLayout.height(of: manager.usedRect(for: container)))
+        view.update(blocks, size: size, muted: muted)
     }
 }
 
-private final class LinkedTextView: NSTextView, NSTextViewDelegate {
-    var renderedContent: MessageTextContent?
+final class LinkedTextView: NSTextView, NSTextViewDelegate {
+    private var blocks: [MessageDocument.Block]?
+    private var size: MessageTextSize?
     var theme: WorkbenchTheme?
-    var muted = false
+    private(set) var muted = false
+
+    static func readOnly() -> LinkedTextView {
+        let view = LinkedTextView(frame: .zero)
+        view.isEditable = false
+        view.isSelectable = true
+        view.drawsBackground = false
+        view.delegate = view
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = false
+        view.textContainer?.heightTracksTextView = false
+        view.isHorizontallyResizable = false
+        view.isVerticallyResizable = false
+        _ = view.layoutManager
+        return view
+    }
+
+    func update(_ blocks: [MessageDocument.Block], size: MessageTextSize, muted: Bool) {
+        guard self.blocks != blocks || self.size != size || self.muted != muted else { return }
+        self.blocks = blocks
+        self.size = size
+        self.muted = muted
+
+        let attributed = MessageTextLayout.attributed(blocks, size: size, muted: muted)
+        let previous = string as NSString
+        let current = attributed.string as NSString
+        let selection = selectedRanges
+        let canRestore =
+            selection.contains { $0.rangeValue.length > 0 }
+            && selection.allSatisfy { value in
+                let range = value.rangeValue
+                guard range.location != NSNotFound, NSMaxRange(range) <= min(previous.length, current.length) else {
+                    return false
+                }
+                let prefix = NSRange(location: 0, length: NSMaxRange(range))
+                return previous.substring(with: prefix) == current.substring(with: prefix)
+            }
+        textContainer?.containerSize = NSSize(width: size.documentWidth, height: .greatestFiniteMagnitude)
+        textStorage?.setAttributedString(attributed)
+        if canRestore { selectedRanges = selection }
+    }
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
         guard let url = link as? URL else { return false }
@@ -343,6 +474,14 @@ private final class LinkedTextView: NSTextView, NSTextViewDelegate {
         show.target = self
         show.representedObject = file
         menu.addItem(show)
+        if selectedRanges.contains(where: { $0.rangeValue.length > 0 }) {
+            menu.addItem(.separator())
+            let copy = NSMenuItem(
+                title: UIStrings.current.text("transcript.copy_selection"),
+                action: #selector(NSText.copy(_:)), keyEquivalent: "")
+            copy.target = self
+            menu.addItem(copy)
+        }
         return menu
     }
 

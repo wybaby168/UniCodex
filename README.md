@@ -22,12 +22,19 @@ Continue the same chat with another provider and turn the previous answer into a
 ## What you can do
 
 - **Work in parallel.** Open multiple chats, let tasks run independently, and rename or archive work as you go.
+- **Plan and implement.** Choose an engine-supported collaboration mode by the message composer. In Plan mode, answer Codex’s clarifying questions and review its proposed plan. **Implement Plan** continues in the same chat using Default mode.
 - **Switch models mid-conversation.** Pick a provider, model, and supported reasoning level for the next turn. Cross-provider continuations carry recent conversation context into the new engine.
-- **Work with long transcripts.** Read native Markdown, collapse tool output and reasoning summaries, and open local file links or reveal them in Finder.
+- **Work with long transcripts.** Select text across Markdown blocks, copy progress messages and replies, collapse tool output and reasoning summaries, and open local file links or reveal them in Finder.
 - **Delegate from another agent.** Send tasks over local MCP and follow their status by task ID.
 - **Use a native macOS interface.** SwiftUI and AppKit provide the window, menus, and transcript. Liquid Glass is available on macOS 26 and later. The interface supports English, Simplified Chinese, Japanese, Korean, German, French, and Russian.
 
-## Build and install
+## Install
+
+Download the universal ZIP for Apple silicon and Intel Macs running macOS 14 or later. Extract it and move **UniCodex.app** to **Applications**. [Download UniCodex](https://github.com/wybaby168/UniCodex/releases/latest)
+
+The v1.11.7 archive uses the maintainer’s signing certificate. It has no Apple notarization ticket, so Gatekeeper may block the first launch. You can also build locally.
+
+### Build from source
 
 You need macOS 14 or later, Xcode 26 or later selected as the active developer directory, and Python 3.11 or later. The build targets the Mac’s current architecture.
 
@@ -41,7 +48,7 @@ This installs `/Applications/UniCodex.app`. The first build creates a local sign
 
 ### First run
 
-1. Open UniCodex. It uses its managed Codex engine or the engine bundled with ChatGPT in Applications. If the engine is missing, use **Preferences → Engine → Check for Updates** and reopen UniCodex after the update is verified.
+1. Open UniCodex. It uses its managed Codex engine or the engine bundled with ChatGPT in Applications. If the engine is missing, look under **Preferences → Updates → Codex Engine** and check for updates. Reopen UniCodex after the update is verified.
 2. Open **Preferences → Providers** from the sidebar gear or with **⌘,**. Select a provider profile and save its API key. For a new OpenAI key, add an OpenAI profile with **+**.
 3. Choose a working folder and a model in the chat toolbar, then send a task. Open **Appearance** to choose the app language and accent color.
 
@@ -55,6 +62,14 @@ This installs `/Applications/UniCodex.app`. The first build creates a local sign
 
 New provider keys are stored in the local macOS Keychain. UniCodex uses an application-specific directory for its engine, workspaces, and session state.
 
+## Updates
+
+UniCodex checks [GitHub Releases](https://github.com/wybaby168/UniCodex/releases) for a stable application update on launch. **Preferences → Updates** shows the installed version and lets you check again. Matching installers open in your browser for manual installation.
+
+The Codex engine checks for stable releases on launch and every 24 hours. It starts with OpenAI’s CDN and automatically falls back to the official GitHub release and npm distribution. UniCodex verifies the checksum, macOS code signature, and app-server compatibility before selecting a new engine for the next launch. Update checks remove unused managed engines and abandoned download files. Active sessions keep using their current engine.
+
+Run `./build.sh --release` to create a locally signed `UniCodex-macos-universal.zip` and its `SHA256SUMS` in `build/`. For Apple notarization, use a Developer ID Application certificate, hardened runtime, and a secure timestamp. Staple the ticket to the DMG, or to the app before creating the final ZIP. The GitHub updater recognizes the `UniCodex-macos-arm64`, `UniCodex-macos-x86_64`, and `UniCodex-macos-universal` asset names with a `.dmg` or `.zip` extension. [Apple’s notarization guide](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+
 ## Local MCP
 
 Open **Preferences → Agent** to copy the stdio server configuration. To register it in Codex, run the following command.
@@ -65,8 +80,8 @@ codex mcp add codex_api_workbench -- /Applications/UniCodex.app/Contents/MacOS/A
 
 | Tool | Purpose |
 | --- | --- |
-| `list_models` | List configured providers and models. Pass a provider ID to see supported reasoning levels. |
-| `dispatch_task` | Start a task with an optional absolute workspace path, provider, model, and reasoning level. Reuse a `request_id` with the same input when retrying. |
+| `list_models` | List configured providers, models, and collaboration mode IDs. Pass a provider ID to see supported reasoning levels. |
+| `dispatch_task` | Start a task with an optional absolute workspace path, provider, model, reasoning level, and `mode`. Reuse a `request_id` with the same input when retrying. |
 | `task_status` | Check progress or wait up to 20 seconds for a status change. Retrieve the answer when the task finishes. |
 | `cancel_task` | Stop a task started through MCP. |
 
@@ -83,7 +98,7 @@ For example, an MCP client can pass these arguments to `dispatch_task` after con
 }
 ~~~
 
-Call `task_status` with the returned `task_id`. Approvals requested during a task appear in UniCodex. The MCP connection runs locally under the current macOS user.
+Set `"mode": "plan"` to request a plan. Call `task_status` with the returned `task_id`. If it reports `waiting_input`, answer the question in the UniCodex chat. Approvals appear there too. The MCP connection runs locally under the current macOS user.
 
 ## Develop and verify
 

@@ -268,6 +268,9 @@ final class AgentMCPStdio {
                     "type": "string", "description": "Absolute folder path. Omit for the standalone workspace.",
                 ],
                 "provider": ["type": "string"], "model": ["type": "string"], "effort": ["type": "string"],
+                "mode": [
+                    "type": "string", "description": "Collaboration mode ID from list_models. Defaults to default.",
+                ],
                 "request_id": ["type": "string", "maxLength": 128],
             ], required: ["prompt"], readOnly: false, idempotent: false),
         tool(
@@ -284,7 +287,8 @@ final class AgentMCPStdio {
                 "task_id": ["type": "string"]
             ], required: ["task_id"], readOnly: false, idempotent: true),
         tool(
-            "list_models", "List configured model IDs. Filter by provider ID for reasoning levels.",
+            "list_models",
+            "List configured model IDs and collaboration modes. Filter by provider ID for reasoning levels.",
             properties: [
                 "provider": ["type": "string"]
             ], required: [], readOnly: true, idempotent: true),

@@ -80,19 +80,30 @@ def verify_signature(bundle, identity):
 def prepare_credential_helper(bundle, identity, keychain):
     source = ROOT / "Sources/Credentials/ProviderCredentialHelper.swift"
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    architectures = output("/usr/bin/lipo", "-archs", str(bundle / "Contents/MacOS/APIWorkbench")).split()
     previous = APPLICATION / HELPER
     executable = bundle / HELPER
     executable.parent.mkdir(parents=True, exist_ok=True)
     requirement = f'identifier "{IDENTIFIER}.credential-helper" and certificate leaf = H"{identity}"'
     verify = ["/usr/bin/codesign", "--verify", "--strict", "-R", "=" + requirement]
     marker = APPLICATION / HELPER_SOURCE_HASH
-    if previous.is_file() and marker.is_file() and marker.read_text() == digest:
+    if (previous.is_file() and marker.is_file() and marker.read_text() == digest
+            and set(output("/usr/bin/lipo", "-archs", str(previous)).split()) == set(architectures)):
         subprocess.run([*verify, str(previous)], check=True)
         shutil.copy2(previous, executable)
     else:
-        target = output("/usr/bin/uname", "-m").strip() + "-apple-macosx14.0"
-        subprocess.run(["/usr/bin/xcrun", "swiftc", "-swift-version", "5", "-target", target, "-O",
-                        "-suppress-warnings", str(source), "-o", str(executable)], check=True)
+        with tempfile.TemporaryDirectory(prefix=".helper-", dir=bundle.parent) as scratch:
+            slices = []
+            for architecture in architectures:
+                target = architecture + "-apple-macosx14.0"
+                binary = Path(scratch) / architecture
+                subprocess.run(["/usr/bin/xcrun", "swiftc", "-swift-version", "5", "-target", target, "-O",
+                                "-suppress-warnings", str(source), "-o", str(binary)], check=True)
+                slices.append(binary)
+            if len(slices) == 1:
+                slices[0].rename(executable)
+            else:
+                subprocess.run(["/usr/bin/lipo", "-create", *slices, "-output", executable], check=True)
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", identity, "--keychain", str(keychain),
                         "--identifier", IDENTIFIER + ".credential-helper", "--options", "runtime",
                         "--timestamp=none", "--requirements", "=designated => " + requirement, str(executable)], check=True)

@@ -4,6 +4,7 @@ import Foundation
 enum AgentTaskStatus: String, Codable {
     case starting, running, stopping, completed, failed, cancelled, interrupted
     case waitingApproval = "waiting_approval"
+    case waitingInput = "waiting_input"
 
     var isFinished: Bool {
         self == .completed || self == .failed || self == .cancelled || self == .interrupted
@@ -145,10 +146,11 @@ struct AgentDispatchArguments: Decodable {
     let provider: String?
     let model: String?
     let effort: String?
+    let mode: String?
     let requestID: String?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case prompt, workspace, provider, model, effort
+        case prompt, workspace, provider, model, effort, mode
         case requestID = "request_id"
     }
 }

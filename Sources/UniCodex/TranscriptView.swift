@@ -8,6 +8,7 @@ struct TranscriptHostedRow: View {
     let session: WorkbenchSession
     let expanded: Set<String>
     @Environment(\.workbenchTheme) private var theme
+    @State private var copied: UUID?
 
     var body: some View {
         Group {
@@ -25,7 +26,7 @@ struct TranscriptHostedRow: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("reasoning-disclosure")
-            case .user, .answer, .progress:
+            case .user, .answer, .plan, .progress:
                 if let entry = source.entry(row.items.lowerBound) { message(entry) }
             }
         }
@@ -37,33 +38,73 @@ struct TranscriptHostedRow: View {
             HStack {
                 Spacer(minLength: TranscriptLayout.leadingBubbleSpace)
                 messageBody(entry)
-                    .frame(width: row.bodyWidth)
                     .padding(TranscriptLayout.bubblePadding)
                     .background(theme.accent.opacity(0.10), in: .rect(cornerRadius: 13))
             }
         } else {
             VStack(alignment: .leading, spacing: TranscriptLayout.headerGap) {
                 HStack {
-                    Text(entry.kind == .progress ? strings.text("transcript.progress") : "Codex").font(
-                        .callout.weight(.semibold))
-                    Spacer()
-                    if entry.kind == .answer {
-                        Button(strings.text("transcript.copy"), systemImage: "document.on.document") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(entry.text, forType: .string)
-                        }
-                        .labelStyle(.iconOnly).buttonStyle(.borderless).foregroundStyle(.secondary)
+                    switch entry.kind {
+                    case .plan:
+                        Label(strings.text("mode.proposed_plan"), systemImage: "list.bullet.clipboard")
+                            .foregroundStyle(theme.accent)
+                    case .progress:
+                        Text(strings.text("transcript.progress"))
+                    default:
+                        Text("Codex")
                     }
-                }.frame(height: TranscriptLayout.headerHeight)
+                    Spacer()
+                    copyButton(for: entry)
+                }
+                .font(.callout.weight(.semibold))
+                .frame(height: TranscriptLayout.headerHeight)
                 messageBody(entry)
             }
         }
     }
 
+    private func copyButton(for entry: TranscriptEntry) -> some View {
+        let key =
+            switch entry.kind {
+            case .plan: "mode.copy_plan"
+            case .progress: "transcript.copy_progress"
+            default: "transcript.copy"
+            }
+        return Button {
+            let clipboard = NSPasteboard.general
+            clipboard.clearContents()
+            if clipboard.setString(entry.text, forType: .string) { copied = UUID() }
+        } label: {
+            Image(systemName: copied == nil ? "document.on.document" : "checkmark")
+                .frame(width: 24, height: TranscriptLayout.headerHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel(strings.text(copied == nil ? key : "transcript.copied"))
+        .help(strings.text(copied == nil ? key : "transcript.copied"))
+        .task(id: copied) {
+            guard copied != nil else { return }
+            do { try await Task.sleep(for: .milliseconds(1400)) } catch { return }
+            copied = nil
+        }
+    }
+
+    @ViewBuilder
     private func messageBody(_ entry: TranscriptEntry, muted: Bool = false) -> some View {
-        TranscriptMessageBody(
-            blocks: TranscriptLayout.blocks(for: entry, in: source.folder),
-            sizes: row.textSizes, muted: muted)
+        if let size = row.textSize {
+            let text = LinkedMessageText(
+                blocks: TranscriptLayout.blocks(for: entry, in: source.folder),
+                size: size, theme: theme, muted: muted
+            )
+            .frame(width: size.documentWidth, height: size.height)
+            if size.scrollsHorizontally {
+                ScrollView(.horizontal) { text }
+                    .frame(width: size.viewportWidth, height: size.height)
+            } else {
+                text
+            }
+        }
     }
 
     private var tools: some View {
@@ -146,70 +187,5 @@ struct LogExcerpt: View {
         }
         .frame(height: CGFloat(lines) * 16 + 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct TranscriptMessageBody: View {
-    let blocks: [MessageDocument.Block]
-    let sizes: [CGSize]
-    let muted: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: TranscriptLayout.bodySpacing) {
-            ForEach(0..<min(blocks.count, sizes.count), id: \.self) { index in
-                let size = sizes[index]
-                let block = blocks[index]
-                rendered(block, size: size)
-                    .padding(.leading, block.indent.leading)
-                    .overlay(alignment: .topLeading) { indentation(block.indent, height: size.height) }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func rendered(_ block: MessageDocument.Block, size: CGSize) -> some View {
-        switch block {
-        case .paragraph(let runs, let style):
-            MessageParagraph(content: .runs(runs, heading: style.heading), muted: muted)
-                .frame(height: size.height)
-                .accessibilityAddTraits(style.heading == nil ? [] : .isHeader)
-        case .code(let code, let indent):
-            ScrollView(.horizontal) {
-                MessageParagraph(content: .runs([.init(text: code, code: true)]), muted: muted)
-                    .frame(width: max(1, size.width - indent.leading - 20), height: size.height - 20)
-                    .padding(10)
-            }
-            .frame(height: size.height)
-            .background(.quaternary, in: .rect(cornerRadius: 8))
-        case .table(let table, let indent):
-            ScrollView(.horizontal) {
-                MessageParagraph(content: .table(table), muted: muted)
-                    .frame(width: max(1, size.width - indent.leading), height: size.height)
-            }
-            .frame(height: size.height)
-            .clipShape(.rect(cornerRadius: 7))
-        case .divider:
-            Rectangle().fill(.quaternary).frame(height: 1).frame(height: size.height)
-                .accessibilityHidden(true)
-        }
-    }
-
-    private func indentation(_ indent: MarkdownIndent, height: CGFloat) -> some View {
-        ZStack(alignment: .topLeading) {
-            HStack(spacing: 10) {
-                ForEach(0..<indent.quotes, id: \.self) { _ in
-                    Capsule().fill(.secondary.opacity(0.34)).frame(width: 2, height: height)
-                }
-            }
-            if let marker = indent.marker {
-                Text(marker).font(
-                    .system(size: muted ? TranscriptTypography.summarySize : TranscriptTypography.textSize)
-                )
-                .foregroundStyle(.secondary)
-                .frame(width: indent.markerWidth - 7, alignment: .trailing)
-                .padding(.leading, indent.markerX)
-            }
-        }
-        .allowsHitTesting(false)
     }
 }

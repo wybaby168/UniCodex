@@ -5,8 +5,7 @@ struct TranscriptLayoutRow: Sendable {
     let items: Range<Int>
     let top: CGFloat
     let height: CGFloat
-    let textSizes: [CGSize]
-    var bodyWidth: CGFloat? = nil
+    var textSize: MessageTextSize? = nil
 
     var bottom: CGFloat { top + height }
 }
@@ -18,7 +17,6 @@ enum TranscriptLayout {
     static let disclosureGap: CGFloat = 5
     static let headerHeight: CGFloat = 21
     static let headerGap: CGFloat = 7
-    static let bodySpacing: CGFloat = 9
     static let bubblePadding: CGFloat = 11
     static let leadingBubbleSpace: CGFloat = 54
     private static let maxToolGroup = 24
@@ -42,7 +40,7 @@ enum TranscriptLayout {
                 let items = index..<end
                 let groupID = "tools:\(record.id)"
                 let height = toolHeight(snapshot.records[items], groupID: groupID, expanded: expanded)
-                rows.append(.init(id: groupID, items: items, top: nextTop, height: height, textSizes: []))
+                rows.append(.init(id: groupID, items: items, top: nextTop, height: height))
                 index = end
                 nextTop += height + spacing
                 continue
@@ -50,24 +48,21 @@ enum TranscriptLayout {
 
             let isCollapsed = record.kind == .reasoning && !expanded.contains(record.id)
             let entry = isCollapsed ? nil : snapshot.entry(index)
-            let sizes = entry.map { textSizes(for: $0, width: width, folder: snapshot.folder) } ?? []
-            let body = sizes.reduce(0) { $0 + $1.height } + CGFloat(max(0, sizes.count - 1)) * bodySpacing
+            let available = record.kind == .user ? max(25, width - leadingBubbleSpace - 2 * bubblePadding) : width
+            let size = entry.map {
+                MessageTextLayout.measure(
+                    blocks(for: $0, in: snapshot.folder), width: available,
+                    muted: record.kind == .reasoning, fitsContent: record.kind == .user)
+            }
+            let body = size?.height ?? 0
             let height: CGFloat
             switch record.kind {
             case .user: height = 2 * bubblePadding + body
-            case .answer, .progress: height = headerHeight + headerGap + max(18, body)
-            case .reasoning: height = disclosureHeight + (sizes.isEmpty ? 0 : disclosureGap + body)
+            case .answer, .plan, .progress: height = headerHeight + headerGap + max(18, body)
+            case .reasoning: height = disclosureHeight + (size == nil ? 0 : disclosureGap + body)
             case .activity: height = disclosureHeight
             }
-            let bodyWidth =
-                record.kind == .user
-                ? min(
-                    messageWidth(for: .user, width: width),
-                    sizes.map(\.width).max() ?? 1) : nil
-            rows.append(
-                .init(
-                    id: record.id, items: index..<(index + 1), top: nextTop, height: height,
-                    textSizes: sizes, bodyWidth: bodyWidth))
+            rows.append(.init(id: record.id, items: index..<(index + 1), top: nextTop, height: height, textSize: size))
             index += 1
             nextTop += height + spacing
         }
@@ -76,36 +71,6 @@ enum TranscriptLayout {
 
     static func blocks(for entry: TranscriptEntry, in folder: URL) -> [MessageDocument.Block] {
         return entry.document?.blocks ?? MessageDocument(entry.text, in: folder).blocks
-    }
-
-    private static func messageWidth(for kind: TranscriptEntry.Kind, width: CGFloat) -> CGFloat {
-        kind == .user ? max(25, width - leadingBubbleSpace - 2 * bubblePadding) : width
-    }
-
-    private static func textSizes(for entry: TranscriptEntry, width: CGFloat, folder: URL) -> [CGSize] {
-        let available = messageWidth(for: entry.kind, width: width)
-        let muted = entry.kind == .reasoning
-        return blocks(for: entry, in: folder).map { block in
-            let leading = block.indent.leading
-            let textWidth = max(1, available - leading)
-            switch block {
-            case .paragraph(let runs, let style):
-                let size = MessageTextLayout.measure(
-                    .runs(runs, heading: style.heading), width: textWidth, muted: muted)
-                return .init(width: size.width + leading, height: size.height)
-            case .code(let text, _):
-                let size = MessageTextLayout.measure(
-                    .runs([.init(text: text, code: true)]),
-                    width: 1_000_000, muted: muted)
-                return .init(width: size.width + leading + 20, height: size.height + 20)
-            case .table(let table, _):
-                let width = max(textWidth, CGFloat(table.columns.count) * 94)
-                let size = MessageTextLayout.measure(.table(table), width: width, muted: muted)
-                return .init(width: width + leading, height: size.height)
-            case .divider:
-                return .init(width: available, height: 8)
-            }
-        }
     }
 
     private static func toolHeight(

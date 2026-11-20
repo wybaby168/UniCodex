@@ -8,4 +8,4 @@ UniCodex starts a separately installed Codex executable or obtains a verified en
 
 ## Platform and provider names
 
-The application uses Apple platform frameworks and SF Symbols. OpenAI, Codex, DeepSeek, Kimi Code, and Google Gemini identify the respective products and services. The UniCodex logo is project artwork. The provider indicators use SF Symbols.
+The application uses Apple platform frameworks and SF Symbols. The UniCodex logo is project artwork. The OpenAI, DeepSeek, Kimi Code, and Google Gemini marks identify the providers in model menus and preferences. The sources and appearance variants are documented in [ProviderMarks-SOURCE.txt](Resources/ProviderMarks-SOURCE.txt).

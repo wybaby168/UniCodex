@@ -1,0 +1,15 @@
+Provider marks in this app identify the API selected in the interface. Each mark belongs to its respective owner.
+
+OpenAI Blossom: black and white SVGs from https://cdn.openai.com/brand/openai-logos.zip. The SVG artboard trims transparent space for small controls. The original path and colors are preserved.
+Usage guidance: https://openai.com/brand/
+
+DeepSeek whale: the leading path from the official DeepSeek Harness BrandWordmark component. Its currentColor artwork is rendered in black and white with the original geometry.
+Artwork: https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/ui-primitives/src/BrandWordmark.tsx
+Usage guidance: https://github.com/deepseek-ai/awesome-deepseek-integration/blob/main/docs/_logo%20svg/guidelines.md
+
+Kimi: original light and dark K-only SVGs from Moonshot AI's branding guide.
+Artwork: https://github.com/MoonshotAI/Branding-Guide/tree/main/scenarios/04-k-only
+Usage guidance: https://www.kimi.com/zh-cn/policies/logo-usage-terms
+
+Gemini: monochrome variants of the original sparkle contour published by Google AI Studio.
+Artwork: https://www.gstatic.com/images/branding/productlogos/gemini_2026/v1/192px.svg

@@ -34,7 +34,7 @@ struct ThreadSummary {
 }
 
 struct TranscriptEntry: Identifiable, Equatable, Codable, Sendable {
-    enum Kind: String, Codable, Sendable { case user, answer, progress, reasoning, activity }
+    enum Kind: String, Codable, Sendable { case user, answer, plan, progress, reasoning, activity }
     enum ActivityState: String, Codable, Sendable { case running, failed, complete }
 
     var id: String
@@ -50,7 +50,7 @@ struct TranscriptEntry: Identifiable, Equatable, Codable, Sendable {
     }
 
     var needsDocument: Bool {
-        document == nil && !isStreaming && !text.isEmpty && (kind == .user || kind == .answer || kind == .progress)
+        document == nil && !isStreaming && !text.isEmpty && kind != .activity && kind != .reasoning
     }
 
     var estimatedBytes: Int {
@@ -117,7 +117,7 @@ struct TranscriptEntry: Identifiable, Equatable, Codable, Sendable {
             self.init(id: id, kind: .activity, text: "工具 · " + (data["tool"] as? String ?? "Codex"))
             activityState = Self.activityStatus(data["status"] as? String)
         case "plan":
-            self.init(id: id, kind: .progress, text: data["text"] as? String ?? "")
+            self.init(id: id, kind: .plan, text: data["text"] as? String ?? "")
         default:
             return nil
         }
@@ -162,6 +162,8 @@ final class WorkbenchSession: Identifiable {
     var modelID: String
     var profileID = ProviderProfile.originalID
     var runningRoute: ModelRoute?
+    var collaborationModeID = CollaborationMode.standard.id
+    var runningCollaborationModeID: String?
     var contextLimited = false
     var reasoningByModel: [String: String]
     var permissionMode: SessionPermissionMode = .workspace
@@ -181,6 +183,8 @@ final class WorkbenchSession: Identifiable {
     var hasUnreadResult = false
     var approvals: [Approval] = []
     var answeringApprovalIDs: Set<String> = []
+    var inputRequests: [UserInputRequest] = []
+    var answeringInputIDs: Set<String> = []
     var expandedOperations: Set<String> = []
     private(set) var entries: [TranscriptEntry] = []
     private(set) var revision = 0
@@ -199,6 +203,7 @@ final class WorkbenchSession: Identifiable {
     private struct StreamKey: Hashable {
         let id: String
         let summaryIndex: Int?
+        let kind: TranscriptEntry.Kind
     }
     @ObservationIgnored private var deltaOrder: [StreamKey] = []
     @ObservationIgnored private var deltas: [StreamKey: String] = [:]
@@ -223,6 +228,11 @@ final class WorkbenchSession: Identifiable {
 
     var isActive: Bool { runState != .idle }
     var isLoading: Bool { loadState == .loading }
+    var awaitsInteraction: Bool { !approvals.isEmpty || !inputRequests.isEmpty }
+    var proposedPlan: TranscriptEntry? {
+        entries.reversed().prefix { $0.kind != .user }
+            .first { $0.kind == .plan && !$0.isStreaming && !$0.text.isEmpty }
+    }
     var hasVisibleEntries: Bool {
         _ = revision
         return !timeline.records.isEmpty
@@ -236,6 +246,7 @@ final class WorkbenchSession: Identifiable {
     }
 
     func status(using strings: UIStrings) -> String {
+        if !inputRequests.isEmpty && isActive { return strings.text("question.waiting") }
         if !approvals.isEmpty && isActive { return strings.text("session.waiting") }
         switch runState {
         case .starting: return strings.text("session.sending")
@@ -265,9 +276,9 @@ final class WorkbenchSession: Identifiable {
         trimRecentEntries()
     }
 
-    func appendDelta(id: String, text: String, summaryIndex: Int? = nil) {
+    func appendDelta(id: String, text: String, summaryIndex: Int? = nil, kind: TranscriptEntry.Kind = .answer) {
         guard !text.isEmpty else { return }
-        let key = StreamKey(id: id, summaryIndex: summaryIndex)
+        let key = StreamKey(id: id, summaryIndex: summaryIndex, kind: kind)
         if deltas[key] == nil { deltaOrder.append(key) }
         deltas[key, default: ""] += text
         guard deltaFlush == nil else { return }
@@ -297,7 +308,7 @@ final class WorkbenchSession: Identifiable {
                     entries[index].document = nil
                 } else {
                     positions[id] = entries.count
-                    entries.append(.init(id: id, kind: .answer, text: text, isStreaming: true))
+                    entries.append(.init(id: id, kind: key.kind, text: text, isStreaming: true))
                 }
                 if let index = positions[id] { markChanged(timeline.update(entries[index])) }
                 streamingIDs.insert(id)
@@ -326,14 +337,18 @@ final class WorkbenchSession: Identifiable {
         trimRecentEntries()
     }
 
-    func clearApprovals() {
+    func clearRequests() {
         approvals.removeAll()
         answeringApprovalIDs.removeAll()
+        inputRequests.removeAll()
+        answeringInputIDs.removeAll()
     }
 
-    func clearApproval(_ id: String) {
+    func clearRequest(_ id: String) {
         approvals.removeAll { $0.id == id }
         answeringApprovalIDs.remove(id)
+        inputRequests.removeAll { $0.id == id }
+        answeringInputIDs.remove(id)
     }
 
     func loadTranscript(_ archive: TranscriptArchive) {

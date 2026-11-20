@@ -88,6 +88,7 @@ final class WorkbenchDelegate: NSObject, NSApplicationDelegate {
         @NSApplicationDelegateAdaptor(WorkbenchDelegate.self) private var delegate
         @State private var workbench: Workbench
         @State private var engineUpdate: CodexEngineUpdate
+        @State private var appUpdate = UniCodexAppUpdate()
         @AppStorage(UIStrings.preference) private var language = UIStrings.system
         private var strings: UIStrings { UIStrings(selection: language) }
 
@@ -109,6 +110,7 @@ final class WorkbenchDelegate: NSObject, NSApplicationDelegate {
                         delegate.startAgentServer(workbench: workbench)
                     }
                     .task { await engineUpdate.monitor() }
+                    .task { await appUpdate.check() }
             }
             .defaultSize(width: 1140, height: 760)
             .windowResizability(.contentMinSize)
@@ -127,8 +129,8 @@ final class WorkbenchDelegate: NSObject, NSApplicationDelegate {
                     preferencesTab("settings.appearance", systemImage: "paintpalette") {
                         AppearanceSettings()
                     }
-                    preferencesTab("settings.engine", systemImage: "arrow.trianglehead.clockwise.rotate.90") {
-                        EngineUpdateSettings(update: engineUpdate)
+                    preferencesTab("settings.updates", systemImage: "arrow.trianglehead.clockwise.rotate.90") {
+                        UpdateSettings(appUpdate: appUpdate, engineUpdate: engineUpdate)
                     }
                     preferencesTab("settings.agent", systemImage: "terminal") {
                         AgentSettings(workbench: workbench)
@@ -190,37 +192,59 @@ struct AgentSettings: View {
     }
 }
 
-struct EngineUpdateSettings: View {
+struct UpdateSettings: View {
     @Environment(\.uiStrings) private var strings
-    let update: CodexEngineUpdate
+    let appUpdate: UniCodexAppUpdate
+    let engineUpdate: CodexEngineUpdate
 
     var body: some View {
         Form {
+            Section("UniCodex") {
+                LabeledContent(
+                    strings.text("app_update.installed"),
+                    value: appUpdate.version?.description ?? "—")
+                HStack {
+                    if appUpdate.working { ProgressView().controlSize(.small) }
+                    Text(appUpdate.message(using: strings))
+                        .font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(strings.text("engine.check")) { Task { await appUpdate.check() } }
+                        .disabled(appUpdate.working)
+                }
+                HStack {
+                    Link(
+                        appUpdate.release == nil ? "GitHub Releases" : strings.text("app_update.notes"),
+                        destination: appUpdate.release?.pageURL ?? UniCodexRelease.releasesPage)
+                    if let download = appUpdate.release?.downloadURL {
+                        Spacer()
+                        Link(strings.text("app_update.download"), destination: download)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
             Section(strings.text("engine.title")) {
                 LabeledContent(
                     strings.text("engine.running_version"),
-                    value: update.activeVersion?.description ?? strings.text("engine.reading"))
-                if let latest = update.latestVersion {
+                    value: engineUpdate.activeVersion?.description ?? strings.text("engine.reading"))
+                if let latest = engineUpdate.latestVersion {
                     LabeledContent(strings.text("engine.latest"), value: latest.description)
                 }
-                if let pending = update.pendingVersion {
+                if let pending = engineUpdate.pendingVersion {
                     LabeledContent(strings.text("engine.on_restart"), value: pending.description)
                 }
-                if let checked = update.lastChecked {
+                if let checked = engineUpdate.lastChecked {
                     LabeledContent(strings.text("engine.last_checked")) {
                         Text(checked, format: .dateTime.month().day().hour().minute())
                     }
                 }
-            }
-            Section {
                 HStack {
-                    if update.working { ProgressView().controlSize(.small) }
-                    Text(update.status(using: strings))
+                    if engineUpdate.working { ProgressView().controlSize(.small) }
+                    Text(engineUpdate.status(using: strings))
                         .font(.callout)
-                        .foregroundStyle(update.failed ? .orange : .secondary)
+                        .foregroundStyle(engineUpdate.failed ? .orange : .secondary)
                     Spacer()
-                    Button(strings.text("engine.check")) { Task { await update.check() } }
-                        .disabled(update.working)
+                    Button(strings.text("engine.check")) { Task { await engineUpdate.check() } }
+                        .disabled(engineUpdate.working)
                 }
                 Text(strings.text("engine.schedule"))
                     .font(.caption).foregroundStyle(.secondary)
@@ -453,10 +477,10 @@ private struct SessionPane: View {
         if #available(macOS 26, *) {
             GlassEffectContainer(spacing: 12) {
                 VStack(spacing: 14) {
-                    if let approval = session.approvals.first {
-                        approvalPrompt(approval)
+                    if session.awaitsInteraction {
+                        interactionPrompt
                             .glassEffect(.regular, in: .rect(cornerRadius: 20))
-                            .glassEffectID("approval", in: bottomGlass)
+                            .glassEffectID("interaction", in: bottomGlass)
                             .glassEffectTransition(.materialize)
                     }
                     composer
@@ -464,16 +488,27 @@ private struct SessionPane: View {
                         .glassEffectID("composer", in: bottomGlass)
                 }
             }
-            .animation(reduceMotion ? nil : .default, value: session.approvals.isEmpty)
+            .animation(reduceMotion ? nil : .default, value: session.awaitsInteraction)
         } else {
             VStack(spacing: 10) {
-                if let approval = session.approvals.first {
-                    approvalPrompt(approval)
+                if session.awaitsInteraction {
+                    interactionPrompt
                     Divider()
                 }
                 composer
             }
             .background(.background)
+        }
+    }
+
+    @ViewBuilder private var interactionPrompt: some View {
+        if let input = session.inputRequests.first {
+            UserInputPrompt(request: input, submitting: session.answeringInputIDs.contains(input.id)) {
+                workbench.resolve(input, in: session, answers: $0)
+            }
+            .id("\(session.id)/\(input.id)")
+        } else if let approval = session.approvals.first {
+            approvalPrompt(approval)
         }
     }
 
@@ -530,7 +565,10 @@ private struct SessionPane: View {
                     }
                 }
             HStack(spacing: 8) {
-                if (session.isActive && session.approvals.isEmpty) || session.isLoading {
+                if workbench.collaborationModes.count > 1 {
+                    collaborationPicker
+                }
+                if (session.isActive && !session.awaitsInteraction) || session.isLoading {
                     ProgressView().controlSize(.small)
                 }
                 let status = session.status(using: strings)
@@ -542,6 +580,12 @@ private struct SessionPane: View {
                         .buttonStyle(.bordered)
                         .disabled(!workbench.canStop(in: session))
                         .help(strings.text("session.stop_help"))
+                } else if session.draft.isEmpty && workbench.canImplementPlan(in: session) {
+                    Button(strings.text("mode.implement"), systemImage: "arrow.right") {
+                        workbench.implementPlan(in: session)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(theme.actionTint)
                 } else {
                     Button(strings.text("common.send"), systemImage: "arrow.up") { workbench.send(in: session) }
                         .buttonStyle(.borderedProminent)
@@ -554,6 +598,37 @@ private struct SessionPane: View {
         }
         .padding(.vertical, 12)
         .padding(.horizontal, 15)
+    }
+
+    private var collaborationPicker: some View {
+        let mode = workbench.collaborationMode(for: session)
+        let title = mode.title(using: strings)
+        let changesNextTurn = session.runningCollaborationModeID.map { $0 != mode.id } == true
+        return Menu {
+            Picker(
+                strings.text("mode.label"),
+                selection: Binding(
+                    get: { mode.id },
+                    set: { workbench.selectCollaborationMode($0, in: session) }
+                )
+            ) {
+                ForEach(workbench.collaborationModes) { candidate in
+                    Label(candidate.title(using: strings), systemImage: candidate.symbol).tag(candidate.id)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label(title, systemImage: mode.symbol)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(mode.isPlan ? theme.accent : .primary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(!canSelectRoute)
+        .accessibilityIdentifier("collaboration-mode")
+        .accessibilityLabel(strings.text("mode.label"))
+        .accessibilityValue(title)
+        .help(changesNextTurn ? strings.text("mode.next", title) : strings.text("mode.help"))
     }
 
     private func selectFolder() {

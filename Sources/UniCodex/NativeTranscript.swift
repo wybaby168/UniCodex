@@ -87,11 +87,16 @@ private final class TranscriptScrollContainer: NSView {
 
 @MainActor
 private final class TranscriptViewport: NSObject {
+    private struct MountedRow {
+        let id: String
+        let host: NSHostingView<AnyView>
+    }
+
     private let session: WorkbenchSession
     private weak var view: TranscriptScrollContainer?
     private var source: TranscriptSnapshot?
     private var rows: [TranscriptLayoutRow] = []
-    private var mounted: [Int: NSHostingView<AnyView>] = [:]
+    private var mounted: [Int: MountedRow] = [:]
     private var reusable: [NSHostingView<AnyView>] = []
     private var worker: Task<[TranscriptLayoutRow], Never>?
     private var dirtyFrom: Int? = 0
@@ -166,8 +171,11 @@ private final class TranscriptViewport: NSObject {
         let snapshot = session.transcriptSnapshot()
         let expansion = expanded
         let first = width == measuredWidth ? rebuildStart(for: dirtyFrom) : 0
-        let start = first < rows.count ? rows[first].items.lowerBound : 0
-        let top = first < rows.count ? rows[first].top : TranscriptLayout.padding
+        let start = first < rows.count ? rows[first].items.lowerBound : rows.last?.items.upperBound ?? 0
+        let top =
+            first < rows.count
+            ? rows[first].top
+            : rows.last.map { $0.bottom + TranscriptLayout.spacing } ?? TranscriptLayout.padding
         let task = Task.detached(priority: .userInitiated) {
             TranscriptLayout.rows(in: snapshot, startingAt: start, top: top, width: width, expanded: expansion)
         }
@@ -181,7 +189,6 @@ private final class TranscriptViewport: NSObject {
                 self.source = snapshot
                 self.shownExpansion = expansion
                 self.measuredWidth = width
-                self.removeRows(atOrAfter: first)
                 self.updateDocumentFrame()
                 if !self.hasOpened && !self.rows.isEmpty {
                     self.hasOpened = true
@@ -192,7 +199,7 @@ private final class TranscriptViewport: NSObject {
                     scroll.reflectScrolledClipView(scroll.contentView)
                     view.showTranscript()
                 }
-                self.render()
+                self.render(refreshFrom: first)
             } else {
                 self.invalidate(from: 0)
             }
@@ -202,8 +209,9 @@ private final class TranscriptViewport: NSObject {
 
     private func rebuildStart(for index: Int) -> Int {
         let row = firstRow { $0.items.upperBound > index }
-        // Keep the preceding group in the rebuild when a new tool can join it.
-        return max(0, row - 1)
+        // An appended tool may join the previous group. Ordinary rows can keep their text view and selection.
+        if row > 0 && rows[row - 1].id.hasPrefix("tools:") { return row - 1 }
+        return row
     }
 
     private func updateDocumentFrame() {
@@ -224,8 +232,8 @@ private final class TranscriptViewport: NSObject {
         }
     }
 
-    private func render() {
-        guard let view, let source, let strings, !rows.isEmpty else { return }
+    private func render(refreshFrom: Int? = nil) {
+        guard let view, let source, let strings else { return }
         let viewport = view.scrollView.documentVisibleRect
         let overscan = min(480, viewport.height * 0.7)
         let first = firstRow { $0.bottom >= viewport.minY - overscan }
@@ -238,27 +246,33 @@ private final class TranscriptViewport: NSObject {
         for index in visible {
             let row = rows[index]
             let host: NSHostingView<AnyView>
-            if let existing = mounted[index] {
-                host = existing
+            if let existing = mounted[index], existing.id == row.id {
+                host = existing.host
+                if let refreshFrom, index >= refreshFrom {
+                    host.rootView = rowContent(row, source: source, strings: strings)
+                }
             } else {
+                recycle(index)
                 host = reusable.popLast() ?? NSHostingView(rootView: AnyView(EmptyView()))
                 host.sizingOptions = []
-                host.rootView = AnyView(
-                    TranscriptHostedRow(
-                        row: row, source: source, session: session,
-                        expanded: shownExpansion
-                    )
-                    .environment(\.workbenchTheme, theme)
-                    .environment(\.uiStrings, strings)
-                    .environment(\.locale, strings.locale)
-                    .tint(theme.accent).id(row.id))
-                mounted[index] = host
+                host.rootView = rowContent(row, source: source, strings: strings)
+                mounted[index] = MountedRow(id: row.id, host: host)
                 view.document.addSubview(host)
             }
             let frame = NSRect(
                 x: (viewportWidth - measuredWidth) / 2, y: row.top, width: measuredWidth, height: row.height)
             if host.frame != frame { host.frame = frame }
         }
+    }
+
+    private func rowContent(_ row: TranscriptLayoutRow, source: TranscriptSnapshot, strings: UIStrings) -> AnyView {
+        AnyView(
+            TranscriptHostedRow(row: row, source: source, session: session, expanded: shownExpansion)
+                .environment(\.workbenchTheme, theme)
+                .environment(\.uiStrings, strings)
+                .environment(\.locale, strings.locale)
+                .tint(theme.accent)
+                .id(row.id))
     }
 
     private func firstRow(where predicate: (TranscriptLayoutRow) -> Bool) -> Int {
@@ -276,7 +290,7 @@ private final class TranscriptViewport: NSObject {
     }
 
     private func recycle(_ index: Int) {
-        guard let host = mounted.removeValue(forKey: index) else { return }
+        guard let host = mounted.removeValue(forKey: index)?.host else { return }
         host.removeFromSuperview()
         host.rootView = AnyView(EmptyView())
         if reusable.count < 12 { reusable.append(host) }

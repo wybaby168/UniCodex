@@ -1,157 +1,29 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Observation
-
-struct CodexEngineVersion: Comparable, Codable, CustomStringConvertible {
-    let description: String
-
-    init?(_ value: String) {
-        guard
-            value.range(
-                of: #"^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}(?:-[a-zA-Z0-9.]+)?$"#,
-                options: .regularExpression) != nil
-        else { return nil }
-        description = value
-    }
-
-    var isStable: Bool { !description.contains("-") }
-
-    static func < (left: Self, right: Self) -> Bool {
-        let lhs = left.description.split(separator: "-", maxSplits: 1)
-        let rhs = right.description.split(separator: "-", maxSplits: 1)
-        let leftCore = lhs[0].split(separator: ".").compactMap { Int($0) }
-        let rightCore = rhs[0].split(separator: ".").compactMap { Int($0) }
-        if leftCore != rightCore { return leftCore.lexicographicallyPrecedes(rightCore) }
-        if lhs.count != rhs.count { return lhs.count > rhs.count }
-        guard lhs.count > 1 else { return false }
-        return lhs[1].compare(rhs[1], options: .numeric) == .orderedAscending
-    }
-}
-
-struct CodexEngineRelease {
-    private struct Listing: Decodable {
-        let tagName: String
-        let assets: [Asset]
-
-        enum CodingKeys: String, CodingKey {
-            case tagName = "tag_name"
-            case assets
-        }
-    }
-    private struct Asset: Decodable {
-        let name: String
-        let digest: String?
-        let browserDownloadURL: String
-
-        enum CodingKeys: String, CodingKey {
-            case name, digest
-            case browserDownloadURL = "browser_download_url"
-        }
-    }
-
-    private static let origin = URL(string: "https://releases.openai.com/codex")!
-    static let programName: String = {
-        #if arch(arm64)
-            "codex-aarch64-apple-darwin"
-        #else
-            "codex-x86_64-apple-darwin"
-        #endif
-    }()
-    let version: CodexEngineVersion
-    let url: URL
-    let sha256: String
-
-    static func latest() async throws -> Self {
-        let (data, response) = try await session.data(
-            for: URLRequest(url: origin.appendingPathComponent("channels/latest"), timeoutInterval: 18))
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw WorkbenchError("暂时无法读取 OpenAI 的稳定版本目录。")
-        }
-        let listing = try JSONDecoder().decode(Listing.self, from: data)
-        let filename = programName + ".tar.gz"
-        guard listing.tagName.hasPrefix("rust-v"),
-            let version = CodexEngineVersion(String(listing.tagName.dropFirst(6))),
-            version.isStable, let asset = listing.assets.first(where: { $0.name == filename }),
-            let digest = asset.digest, digest.range(of: #"^sha256:[a-f0-9]{64}$"#, options: .regularExpression) != nil
-        else {
-            throw WorkbenchError("OpenAI 的版本目录中没有此 Mac 的稳定引擎。")
-        }
-        let url = origin.appendingPathComponent("releases").appendingPathComponent(version.description)
-            .appendingPathComponent(filename)
-        guard url.absoluteString == asset.browserDownloadURL else {
-            throw WorkbenchError("引擎下载地址与 OpenAI 版本目录不符。")
-        }
-        return Self(version: version, url: url, sha256: String(digest.dropFirst("sha256:".count)))
-    }
-
-    func download(into scratch: URL) async throws -> URL {
-        let archive = scratch.appendingPathComponent("engine.tar.gz")
-        let (downloaded, response) = try await Self.session.download(from: url)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw WorkbenchError("OpenAI 的引擎下载暂不可用。")
-        }
-        try FileManager.default.moveItem(at: downloaded, to: archive)
-        let expected = sha256
-        return try await Task.detached(priority: .utility) {
-            let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            guard (1...300 * 1024 * 1024).contains(size), try CodexEngineFiles.digest(archive) == expected else {
-                throw WorkbenchError("下载文件的 SHA-256 校验失败。")
-            }
-            let lines = try CodexEngineFiles.run("/usr/bin/tar", ["-tzf", archive.path])
-                .split(whereSeparator: \.isNewline).map(String.init)
-            guard lines.count == 1, let entry = lines.first,
-                entry == Self.programName || entry == "./" + Self.programName
-            else {
-                throw WorkbenchError("OpenAI 引擎包的内容结构不匹配。")
-            }
-            let program = scratch.appendingPathComponent("codex")
-            _ = try CodexEngineFiles.run(
-                "/usr/bin/tar", ["-xOzf", archive.path, entry], outputFile: program, timeout: 60)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: program.path)
-            _ = try CodexEngineFiles.run("/usr/bin/codesign", ["--verify", "--strict", program.path])
-            guard try CodexEngineFiles.version(of: program) == version else {
-                throw WorkbenchError("引擎可执行文件的版本与发布目录不符。")
-            }
-            return program
-        }.value
-    }
-
-    private final class OfficialDownloads: NSObject, URLSessionTaskDelegate {
-        func urlSession(
-            _ session: URLSession, task: URLSessionTask,
-            willPerformHTTPRedirection response: HTTPURLResponse,
-            newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void
-        ) {
-            let url = request.url
-            completionHandler(url?.scheme == "https" && url?.host == "releases.openai.com" ? request : nil)
-        }
-    }
-
-    private static let session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 35
-        config.timeoutIntervalForResource = 600
-        return URLSession(configuration: config, delegate: OfficialDownloads(), delegateQueue: nil)
-    }()
-}
 
 enum CodexEngineFiles {
     static let bundled = URL(
         fileURLWithPath:
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
 
+    private static let stagingPrefix = ".unicodex-update-"
+    private static let legacyStagingPrefix = ".update-"
+    private static let fileKeys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
+
     private static func directory(in home: URL) -> URL { home.appendingPathComponent("engine", isDirectory: true) }
     private static func receipt(in home: URL) -> URL { directory(in: home).appendingPathComponent("selected-version") }
-    private static func program(_ version: CodexEngineVersion, in home: URL) -> URL {
+    private static func program(_ version: ReleaseVersion, in home: URL) -> URL {
         directory(in: home).appendingPathComponent("codex-" + version.description)
     }
 
-    static func installed(in home: URL) -> (version: CodexEngineVersion, binary: URL)? {
+    static func installed(in home: URL) -> (version: ReleaseVersion, binary: URL)? {
         let root = directory(in: home)
         guard (try? root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false,
             (try? receipt(in: home).resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false,
             let value = try? String(contentsOf: receipt(in: home), encoding: .utf8),
-            let release = CodexEngineVersion(value), release.isStable
+            let release = ReleaseVersion(value), release.isStable
         else { return nil }
         let binary = program(release, in: home)
         guard let info = try? binary.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
@@ -161,25 +33,45 @@ enum CodexEngineFiles {
         return (release, binary)
     }
 
-    static func prepareDownload(in home: URL) throws -> URL {
+    static func acquireUpdateLock(in home: URL) throws -> FileHandle? {
         let root = directory(in: home)
-        guard (try? root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
-            throw WorkbenchError("独立引擎目录指向了其他位置。")
+        for folder in [home, root] {
+            guard (try? folder.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                throw CocoaError(.fileWriteInvalidFileName)
+            }
         }
-        let staging = root.appendingPathComponent(".update-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(
-            at: staging, withIntermediateDirectories: true,
+            at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let lock = root.appendingPathComponent(".update-lock")
+        let descriptor = open(lock.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return handle }
+        if errno == EWOULDBLOCK { return nil }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    static func prepareDownload(in home: URL) throws -> URL {
+        let staging = directory(in: home)
+            .appendingPathComponent(stagingPrefix + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: staging, withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700])
         return staging
     }
 
-    static func publish(_ candidate: URL, version: CodexEngineVersion, in home: URL) throws {
+    static func publish(_ candidate: URL, version: ReleaseVersion, in home: URL) throws {
         guard version.isStable else { throw WorkbenchError("只能安装稳定版本。") }
         if let selected = installed(in: home), selected.version >= version { return }
         let destination = program(version, in: home)
         if FileManager.default.fileExists(atPath: destination.path) {
-            guard try digest(candidate) == digest(destination),
-                (try? destination.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false
+            let info = try destination.resourceValues(forKeys: fileKeys)
+            guard info.isRegularFile == true, info.isSymbolicLink == false,
+                try digest(candidate) == digest(destination)
             else {
                 throw WorkbenchError("已有同版本引擎的内容不匹配。")
             }
@@ -189,29 +81,69 @@ enum CodexEngineFiles {
         try Data(version.description.utf8).write(to: receipt(in: home), options: .atomic)
     }
 
+    // Call while holding the update lock, before staging or after the staging directory is closed.
     static func retireInactive(in home: URL, active: URL) {
-        guard let selected = installed(in: home),
-            let snapshot = try? run("/bin/ps", ["-axww", "-o", "comm="]),
-            let files = try? FileManager.default.contentsOfDirectory(
-                at: directory(in: home),
-                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        let root = directory(in: home)
+        let keys = fileKeys.union([.contentModificationDateKey])
+        guard let snapshot = try? run("/bin/ps", ["-axww", "-o", "comm="]),
+            let files = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys)),
+            let resolved = realpath(root.path, nil)
         else { return }
-        let running = Set(snapshot.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) })
-        for file in files where file != active && file != selected.binary {
-            guard file.lastPathComponent.hasPrefix("codex-"),
-                CodexEngineVersion(String(file.lastPathComponent.dropFirst(6)))?.isStable == true,
-                !running.contains(file.path),
-                let info = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                info.isRegularFile == true, info.isSymbolicLink == false
+        defer { free(resolved) }
+        let roots = Set([root.path, String(cString: resolved)])
+        let running = Set(
+            snapshot.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+                let process = line.trimmingCharacters(in: .whitespaces)
+                guard let directory = roots.first(where: { process.hasPrefix($0 + "/") }) else { return nil }
+                return process.dropFirst(directory.count + 1).split(separator: "/", maxSplits: 1).first.map(String.init)
+            })
+        let selected = installed(in: home)?.binary.lastPathComponent
+        for file in files {
+            let name = file.lastPathComponent
+            guard name != active.lastPathComponent, name != selected,
+                !running.contains(name), let info = try? file.resourceValues(forKeys: keys),
+                info.isSymbolicLink == false
             else { continue }
-            try? FileManager.default.removeItem(at: file)
+            if info.isRegularFile == true, selected != nil, name.hasPrefix("codex-"),
+                ReleaseVersion(String(name.dropFirst("codex-".count)))?.isStable == true
+            {
+                try? FileManager.default.removeItem(at: file)
+            } else if info.isDirectory == true, isAbandonedDownload(file, modified: info.contentModificationDate) {
+                try? FileManager.default.removeItem(at: file)
+            }
         }
     }
 
-    static func version(of program: URL) throws -> CodexEngineVersion {
+    private static func isAbandonedDownload(_ directory: URL, modified: Date?) -> Bool {
+        let name = directory.lastPathComponent
+        let prefix = name.hasPrefix(stagingPrefix) ? stagingPrefix : legacyStagingPrefix
+        guard name.hasPrefix(prefix), UUID(uuidString: String(name.dropFirst(prefix.count))) != nil else {
+            return false
+        }
+        // Earlier versions staged downloads without the lock. Give those downloads time to finish.
+        if prefix == legacyStagingPrefix {
+            guard let modified, Date().timeIntervalSince(modified) > 3600 else { return false }
+        }
+        guard
+            let items = try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: Array(fileKeys))
+        else { return false }
+        return items.allSatisfy { item in
+            guard let info = try? item.resourceValues(forKeys: fileKeys), info.isSymbolicLink == false else {
+                return false
+            }
+            switch item.lastPathComponent {
+            case "codex", "engine.tar.gz": return info.isRegularFile == true
+            case "probe": return info.isDirectory == true
+            default: return false
+            }
+        }
+    }
+
+    static func version(of program: URL) throws -> ReleaseVersion {
         let output = try run(program.path, ["--version"])
         guard let token = output.split(whereSeparator: \.isWhitespace).dropFirst().first,
-            let version = CodexEngineVersion(String(token))
+            let version = ReleaseVersion(String(token))
         else {
             throw WorkbenchError("无法识别 Codex 引擎版本。")
         }
@@ -219,11 +151,15 @@ enum CodexEngineFiles {
     }
 
     static func digest(_ file: URL) throws -> String {
+        try digest(file, using: SHA256.self).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func digest<H: HashFunction>(_ file: URL, using algorithm: H.Type) throws -> H.Digest {
         let input = try FileHandle(forReadingFrom: file)
         defer { try? input.close() }
-        var hash = SHA256()
+        var hash = H()
         while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty { hash.update(data: chunk) }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        return hash.finalize()
     }
 
     static func run(_ program: String, _ arguments: [String], outputFile: URL? = nil, timeout: TimeInterval = 12) throws
@@ -267,9 +203,9 @@ enum CodexEngineFiles {
 @Observable @MainActor
 final class CodexEngineUpdate {
     private let paths: EnginePaths
-    private(set) var activeVersion: CodexEngineVersion?
-    private(set) var latestVersion: CodexEngineVersion?
-    private(set) var pendingVersion: CodexEngineVersion?
+    private(set) var activeVersion: ReleaseVersion?
+    private(set) var latestVersion: ReleaseVersion?
+    private(set) var pendingVersion: ReleaseVersion?
     private(set) var lastChecked: Date?
     private var statusKey = "engine.status_version"
     private var statusVersion: String?
@@ -285,7 +221,7 @@ final class CodexEngineUpdate {
         return strings.text(statusKey)
     }
 
-    private func show(_ key: String, version: CodexEngineVersion? = nil) {
+    private func show(_ key: String, version: ReleaseVersion? = nil) {
         statusKey = key
         statusVersion = version?.description
         statusError = nil
@@ -298,25 +234,30 @@ final class CodexEngineUpdate {
         }
     }
 
-    func check() async {
+    func check(using session: URLSession = CodexEngineRelease.session) async {
         guard !working else { return }
         working = true
         failed = false
         defer { working = false }
         do {
             let paths = self.paths
-            if activeVersion == nil {
-                activeVersion = try? await Task.detached(priority: .utility) {
-                    CodexEngineFiles.retireInactive(in: paths.codexHome, active: paths.binary)
-                    return try CodexEngineFiles.version(of: paths.binary)
-                }.value
-            }
             show("engine.status_check")
-            let release = try await CodexEngineRelease.latest()
-            latestVersion = release.version
-            lastChecked = Date()
+            guard let lock = try CodexEngineFiles.acquireUpdateLock(in: paths.codexHome) else {
+                show("engine.status_busy")
+                return
+            }
+            defer { try? lock.close() }
+            let needsVersion = activeVersion == nil
+            let version = await Task.detached(priority: .utility) {
+                CodexEngineFiles.retireInactive(in: paths.codexHome, active: paths.binary)
+                return needsVersion ? try? CodexEngineFiles.version(of: paths.binary) : nil
+            }.value
+            if let version { activeVersion = version }
             let installed = CodexEngineFiles.installed(in: paths.codexHome)
             pendingVersion = installed.flatMap { $0.binary == paths.binary ? nil : $0.version }
+            let release = try await CodexEngineRelease.latest(using: session)
+            latestVersion = release.version
+            lastChecked = Date()
             let available = [activeVersion, installed?.version].compactMap { $0 }.max()
             if let available, release.version <= available {
                 if let pendingVersion {
@@ -327,13 +268,9 @@ final class CodexEngineUpdate {
                 return
             }
             show("engine.status_download", version: release.version)
-            let staging = try CodexEngineFiles.prepareDownload(in: paths.codexHome)
-            defer { try? FileManager.default.removeItem(at: staging) }
-            let candidate = try await release.download(into: staging)
-            try Task.checkCancellation()
-            try await verifyAppServer(candidate, in: staging)
-            try await Task.detached(priority: .utility) {
-                try CodexEngineFiles.publish(candidate, version: release.version, in: paths.codexHome)
+            try await install(release, using: session)
+            await Task.detached(priority: .utility) {
+                CodexEngineFiles.retireInactive(in: paths.codexHome, active: paths.binary)
             }.value
             pendingVersion = release.version
             show("engine.status_verified", version: release.version)
@@ -345,9 +282,22 @@ final class CodexEngineUpdate {
         }
     }
 
+    private func install(_ release: CodexEngineRelease, using session: URLSession) async throws {
+        let paths = self.paths
+        let staging = try CodexEngineFiles.prepareDownload(in: paths.codexHome)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let candidate = try await release.download(into: staging, using: session)
+        try Task.checkCancellation()
+        try await verifyAppServer(candidate, in: staging)
+        try Task.checkCancellation()
+        try await Task.detached(priority: .utility) {
+            try CodexEngineFiles.publish(candidate, version: release.version, in: paths.codexHome)
+        }.value
+    }
+
     private func verifyAppServer(_ binary: URL, in staging: URL) async throws {
         let probe = EnginePaths(
-            codexHome: staging.appendingPathComponent("probe"),
+            codexHome: staging.appendingPathComponent("probe", isDirectory: true),
             credentialFile: staging.appendingPathComponent("no-key"),
             binary: binary, endpoint: "http://127.0.0.1:1", modelCatalog: paths.modelCatalog)
         try probe.prepare()
@@ -356,11 +306,23 @@ final class CodexEngineUpdate {
         try await ProviderEnginePool.initialize(server, paths: probe)
         _ = try await server.request("model/list", timeout: 10)
         _ = try await server.request("thread/list", ["limit": 1], timeout: 10)
-        let absent: RPCObject = ["threadId": "00000000-0000-7000-8000-000000000000"]
-        for method in ["thread/items/list", "thread/inject_items", "thread/delete"] {
-            do { _ = try await server.request(method, absent, timeout: 8) } catch let error as EngineRequestError
-                where error.code != -32601
-            { continue } catch { throw WorkbenchError("新版引擎暂不支持工作台所需的接口（\(method)）。") }
+        let absent = "00000000-0000-7000-8000-000000000000"
+        var history = TranscriptArchiveBuilder()
+        do {
+            try await TranscriptHistoryReader.read(server, threadID: absent, namespace: nil, into: &history)
+        } catch let error as EngineRequestError where error.code != -32601 {
+            // The fresh probe home has no saved threads.
+        }
+        let probes: [(String, RPCObject)] = [
+            ("thread/inject_items", ["threadId": absent, "items": [] as [RPCObject]]),
+            ("thread/delete", ["threadId": absent]),
+        ]
+        for (method, parameters) in probes {
+            do {
+                _ = try await server.request(method, parameters, timeout: 8)
+            } catch let error as EngineRequestError where error.code != -32601 {
+                continue
+            }
         }
     }
 }
