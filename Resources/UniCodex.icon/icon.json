@@ -1,0 +1,88 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "extended-srgb:0.033,0.388,0.462,1.000",
+      "extended-srgb:0.074,0.111,0.260,1.000"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "name": "Code mark",
+          "image-name": "CodeMark.svg",
+          "fill": {
+            "linear-gradient": [
+              "extended-srgb:1.000,1.000,1.000,1.000",
+              "extended-srgb:0.821,0.976,0.983,1.000"
+            ]
+          }
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.28
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      }
+    },
+    {
+      "blur-material": 0.48,
+      "layers": [
+        {
+          "name": "Lens",
+          "image-name": "Lens.svg",
+          "glass": true,
+          "opacity": 0.87,
+          "fill": {
+            "linear-gradient": [
+              "extended-srgb:0.488,0.980,0.920,1.000",
+              "extended-srgb:0.097,0.552,0.729,1.000"
+            ]
+          }
+        }
+      ],
+      "lighting": "individual",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.46
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.48
+      }
+    },
+    {
+      "layers": [
+        {
+          "name": "Rear pane",
+          "image-name": "RearPane.svg",
+          "glass": true,
+          "opacity": 0.9,
+          "fill": {
+            "linear-gradient": [
+              "extended-srgb:0.307,0.761,0.869,1.000",
+              "extended-srgb:0.314,0.424,0.863,1.000"
+            ]
+          }
+        }
+      ],
+      "lighting": "individual",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.54
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.34
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

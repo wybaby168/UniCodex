@@ -1,0 +1,3 @@
+Public Codex model metadata (Apache-2.0).
+https://github.com/openai/codex/blob/6c0cee502d215e5df2dd9a303cf2e252229c9e12/codex-rs/models-manager/models.json
+This snapshot retains entries listed for API use; individual metadata entries are unchanged.
